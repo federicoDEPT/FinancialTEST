@@ -1,87 +1,97 @@
 import streamlit as st
 import pandas as pd
+from google import genai
+from google.genai import types
 import plotly.express as px
-import google.generativeai as genai
-import io
 
-# 1. AUTHENTICATION & PERSONA [cite: 52]
+# 1. SETUP: Use the NEW API
 api_key = st.secrets["GOOGLE_API_KEY"]
-genai.configure(api_key=api_key)
-model = genai.GenerativeModel('gemini-1.5-flash')
+client = genai.Client(api_key=api_key)
 
-st.title("📊 DEPT Strategic Financial Engine")
+st.title("📊 DEPTapps Strategic Margin Engine")
+st.markdown("Automated 'Actual Truth' Reporting for Plaid & Fullscript")
 
-# Normalization for "Smart" Name Matching [cite: 34]
-def normalize(name):
-    if pd.isna(name): return ""
-    return str(name).lower().strip().replace(" ", "").replace("'", "")
-
-# 2. DATA INGESTION (DEPTapps & Billing Support) [cite: 14, 43]
+# 2. UPLOAD: Excel & CSV support
 with st.sidebar:
-    st.header("Upload Sources")
-    # Supports Excel formats as discussed 
-    hours_file = st.file_uploader("Upload DEPTapps Export", type=['xlsx', 'xls', 'csv'])
-    pricing_file = st.file_uploader("Upload Pricing Plan (CPT)", type=['xlsx', 'xls', 'csv'])
-    billing_file = st.file_uploader("Upload Billing Worksheet", type=['xlsx', 'xls', 'csv'])
+    st.header("Upload Files")
+    h_file = st.file_uploader("DEPTapps/Harvest (Hours)", type=['xlsx', 'csv'])
+    p_file = st.file_uploader("Pricing Plan (CPT)", type=['xlsx', 'csv'])
+    b_file = st.file_uploader("Billing/Media Worksheet", type=['xlsx', 'csv'])
 
-if hours_file and pricing_file and billing_file:
-    # Load data dynamically
-    df_hours = pd.read_excel(hours_file) if hours_file.name.endswith(('xlsx', 'xls')) else pd.read_csv(hours_file)
-    df_plan = pd.read_excel(pricing_file) if pricing_file.name.endswith(('xlsx', 'xls')) else pd.read_csv(pricing_file)
-    df_bill = pd.read_excel(billing_file) if billing_file.name.endswith(('xlsx', 'xls')) else pd.read_csv(billing_file)
+def load_any(file):
+    if file.name.endswith('.csv'): 
+        return pd.read_csv(file)
+    return pd.read_excel(file)
 
-    # 3. SMART INTERPRETATION (THE "SMART" LAYER) [cite: 158, 179]
-    # We feed a data preview to Gemini so it understands the 'Why' behind the numbers
-    data_preview = f"""
-    HOURS SAMPLE: {df_hours.head(10).to_string()}
-    PLAN SAMPLE: {df_plan.head(10).to_string()}
-    BILLING SAMPLE: {df_bill.head(10).to_string()}
+if h_file and p_file and b_file:
+    # Load the data
+    df_h = load_any(h_file)
+    df_p = load_any(p_file)
+    df_b = load_any(b_file)
+
+    # 3. THE "SMART" LAYER: Asking Gemini to map the data
+    st.info("🤖 Gemini is interpreting your file structures and varied income...")
+    
+    snippet = f"""
+    HOURS HEADERS: {list(df_h.columns)}
+    PRICING HEADERS: {list(df_p.columns)}
+    BILLING DATA SNIPPET: {df_b.head(15).to_string()}
     """
+
+    prompt = f"""
+    Act as a Financial Analyst. Look at these DEPT files:
+    1. Which column in 'HOURS' contains the employee names?
+    2. Which column in 'PRICING' contains the employee names?
+    3. Which column in 'PRICING' contains the Cost Rate?
+    4. What is the total 'Dept Fee' or 'Recognized Income' in the Billing snippet?
     
-    st.info("🤖 Gemini is interpreting file structures and varied income...")
+    Return ONLY a Python dictionary like this:
+    {{"h_name": "col_name", "p_name": "col_name", "cost_col": "col_name", "income": 0.0}}
     
-    # AI identifies the varied income and necessary columns
-    intel_prompt = f"""
-    Analyze these DEPT financial snippets. 
-    1. Identify the 'Dept Fee' or 'Income' that varies with media spend. 
-    2. Identify which column in 'HOURS' represents the employee name.
-    3. Identify which column in 'PLAN' represents the employee name.
-    Return ONLY a Python dictionary: {{"income": 0.0, "hours_col": "", "plan_col": ""}}
-    Data: {data_preview}
+    Data: {snippet}
     """
-    
+
     try:
-        intel = eval(model.generate_content(intel_prompt).text)
+        # NEW API call
+        response = client.models.generate_content(
+            model='gemini-2.0-flash-exp',  # Use the latest model
+            contents=prompt
+        )
+        
+        # Extract and clean the response
+        intel = eval(response.text.strip().replace("```json", "").replace("```", ""))
+        
+        # 4. RUN THE MATH
+        df_h['key'] = df_h[intel['h_name']].str.lower().str.strip()
+        df_p['key'] = df_p[intel['p_name']].str.lower().str.strip()
+        
+        merged = pd.merge(df_h, df_p[['key', intel['cost_col']]], on='key', how='left')
+        
+        # Calculate Margin
+        total_labor_cost = (merged['Hours'] * merged[intel['cost_col']]).sum()
         detected_income = intel['income']
-        
-        # 4. ACTUAL TRUTH CALCULATION [cite: 30, 144]
-        df_hours['key'] = df_hours[intel['hours_col']].apply(normalize)
-        df_plan['key'] = df_plan[intel['plan_col']].apply(normalize)
-        
-        # Merge for margin analysis [cite: 159]
-        merged = pd.merge(df_hours, df_plan, on='key', how='left')
-        
-        # Calculate Labor Burn (Hours * Cost Rate) [cite: 32, 145]
-        # We assume 'Cost Rate' exists or take an average [cite: 161]
-        cost_col = next((c for c in merged.columns if 'Cost' in c), None)
-        total_labor_cost = (merged['Hours'] * merged[cost_col]).sum()
         actual_margin = detected_income - total_labor_cost
 
-        # 5. DASHBOARD & INSIGHTS [cite: 178, 183]
-        st.header(f"Account Margin Status: {(actual_margin/detected_income)*100:.1f}%")
-        
-        col1, col2 = st.columns(2)
-        col1.metric("Dynamic Income", f"${detected_income:,.2f}")
-        col2.metric("Labor Burn", f"${total_labor_cost:,.2f}")
+        # 5. DASHBOARD
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Dynamic Income", f"${detected_income:,.2f}")
+        c2.metric("Labor Burn", f"${total_labor_cost:,.2f}")
+        c3.metric("Actual Margin", f"{(actual_margin/detected_income)*100:.1f}%", 
+                  delta=f"${actual_margin:,.2f}")
 
-        # Visualize Seniority Drift [cite: 36, 146]
+        # Task Distribution
         st.subheader("Labor Distribution by Task")
-        st.plotly_chart(px.bar(merged, x='Task', y='Hours', color=intel['hours_col']))
+        task_hours = merged.groupby('Task')['Hours'].sum().reset_index()
+        st.plotly_chart(px.bar(task_hours, x='Task', y='Hours'))
 
-        # 6. EXECUTIVE SUMMARY (Resolving the 'Manual' burden) [cite: 37, 183]
+        # 6. EXECUTIVE SUMMARY
         if st.button("Generate Executive Summary"):
-            summary_prompt = f"Income: {detected_income}, Burn: {total_labor_cost}, Margin: {actual_margin}. Provide 3 bullet points for Becca/Raquel on account health."
-            st.success(model.generate_content(summary_prompt).text)
+            summary_prompt = f"Income: {detected_income}, Cost: {total_labor_cost}, Margin: {actual_margin}. Provide 3 bullets for Becca."
+            sum_resp = client.models.generate_content(
+                model='gemini-2.0-flash-exp',
+                contents=summary_prompt
+            )
+            st.success(sum_resp.text)
 
     except Exception as e:
-        st.error(f"Logic Error: {e}. Please ensure file headers are clear.")
+        st.error(f"Could not interpret files. Error: {e}")
