@@ -58,9 +58,9 @@ if h_file and p_file and b_file:
     """
 
     try:
-        # NEW API CALL - Using the modern google-genai package
+        # ✅ CORRECTED MODEL NAME for new API
         response = client.models.generate_content(
-            model='gemini-1.5-flash',  # Use a supported model
+            model='gemini-2.0-flash-exp',  # ✅ Use this for v1beta
             contents=prompt
         )
         
@@ -168,7 +168,7 @@ if h_file and p_file and b_file:
             """
             
             summary_response = client.models.generate_content(
-                model='gemini-1.5-flash',
+                model='gemini-2.0-flash-exp',  # ✅ Same model here
                 contents=summary_prompt
             )
             
