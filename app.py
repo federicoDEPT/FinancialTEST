@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from google import genai
-from google.genai import types
 import json
 
 # --- 1. CONFIGURATION ---
@@ -16,12 +15,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. SETUP (NEW SDK) ---
+# --- 2. SETUP (NEW v2 SDK) ---
 try:
-    # Initialize the modern Client (v2)
+    # This uses the new library 'google-genai' which supports 1.5-flash natively
     client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
 except Exception as e:
-    st.error(f"API Key Error: {e}")
+    st.error(f"API Key Connection Error: {e}")
 
 # --- 3. INTELLIGENT FUNCTIONS ---
 
@@ -60,11 +59,11 @@ def identify_files_with_ai(file_previews):
     }}
     """
     try:
-        # NEW SDK SYNTAX: client.models.generate_content
+        # NEW SYNTAX: client.models.generate_content
         response = client.models.generate_content(
             model="gemini-1.5-flash",
             contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
+            config={"response_mime_type": "application/json"}
         )
         return json.loads(response.text)
     except Exception as e:
@@ -106,7 +105,7 @@ def get_mapping(df_h, df_p, df_b):
     response = client.models.generate_content(
         model="gemini-1.5-flash",
         contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json")
+        config={"response_mime_type": "application/json"}
     )
     return json.loads(response.text)
 
