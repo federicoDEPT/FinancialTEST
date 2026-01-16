@@ -1,226 +1,229 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import google.generativeai as genai
 import json
+import io
 
-# --- 1. CONFIGURATION & STYLING ---
-st.set_page_config(page_title="DEPT Financial Architect", layout="wide", page_icon="📊")
+# --- 1. CONFIGURATION ---
+st.set_page_config(page_title="DEPT Financial Architect", layout="wide", page_icon="🧠")
 
-# Custom CSS to match the professional "Dashboard" look
+# CSS for Professional "Deck" Look
 st.markdown("""
 <style>
-    .metric-card {
-        background-color: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 10px;
-        padding: 20px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-    }
-    .stMetric {
-        background-color: transparent !important;
-    }
-    /* Header Styling */
-    h1 { font-family: 'Helvetica Neue', sans-serif; font-weight: 700; letter-spacing: -1px; }
-    h3 { font-family: 'Helvetica Neue', sans-serif; font-weight: 600; color: #475569; }
+    .metric-card { background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; }
+    h1 { font-family: 'Helvetica', sans-serif; letter-spacing: -1px; font-weight: 800; }
+    .stFileUploader { padding: 20px; border: 2px dashed #cbd5e1; border-radius: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. SETUP GEMINI (THE BRAIN) ---
+# Setup Gemini
 try:
     api_key = st.secrets["GOOGLE_API_KEY"]
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-except Exception:
-    st.error("⚠️ GOOGLE_API_KEY missing in Streamlit Secrets. AI features will be disabled.")
+    # Force JSON output for machine-readable logic
+    model = genai.GenerativeModel('gemini-1.5-flash', generation_config={"response_mime_type": "application/json"})
+except:
+    st.error("⚠️ GOOGLE_API_KEY missing in Streamlit Secrets.")
 
-# --- 3. HELPER FUNCTIONS ---
-def normalize(name):
-    """Normalize names to ensure 'Mike' matches 'Michael' logic could be added here."""
-    if pd.isna(name): return ""
-    return str(name).lower().strip().replace(" ", "").replace("'", "")
+# --- 2. INTELLIGENT DISCOVERY ENGINE ---
 
-@st.cache_data
-def load_file(file):
-    if file.name.endswith('.csv'): return pd.read_csv(file)
-    return pd.read_excel(file)
+def read_file_preview(file):
+    """Reads the first 30 rows of ANY file to let AI inspect the structure."""
+    try:
+        # Read as generic csv/excel first without assuming headers
+        if file.name.endswith('.csv'):
+            df = pd.read_csv(file, header=None, nrows=30)
+        else:
+            df = pd.read_excel(file, header=None, nrows=30)
+        return df.to_string()
+    except:
+        return ""
 
-def get_ai_mapping(df_h, df_p, df_b):
-    """Asks Gemini to map columns and find variable income to avoid hardcoding crashes."""
+def identify_files_with_ai(file_previews):
+    """
+    Sends file snippets to Gemini. 
+    Asks: 'Which file is the Billing Worksheet? Which is the Hours Log? Where do headers start?'
+    """
     prompt = f"""
-    Act as a Data Engineer. Analyze these 3 file snippets:
-    1. HOURS: {list(df_h.columns)}
-    2. PRICING: {list(df_p.columns)}
-    3. BILLING DATA: {df_b.head(10).to_string()}
+    You are a Forensic Data Analyst. I have uploaded multiple agency financial files. 
+    Your job is to identify which file serves which purpose and find the header row index.
 
-    Task:
-    1. Identify the 'Person' name column in HOURS.
-    2. Identify the 'Person' name column in PRICING.
-    3. Identify the 'Cost Rate' column in PRICING.
-    4. Identify the 'Task' or 'Role' column in HOURS.
-    5. Find the TOTAL 'Recognized Income' or 'Dept Fee' for this month from BILLING (sum if multiple rows).
+    FILE PREVIEWS:
+    {json.dumps(file_previews)}
 
-    Return JSON ONLY:
+    TASKS:
+    1. Find the **HOURS_LOG**: Look for 'Hours', 'Person', 'Date', 'Task', 'Notes'.
+    2. Find the **PRICING_PLAN**: Look for 'Role', 'Rate', 'Cost', 'C Level', 'Name'.
+    3. Find the **BILLING_SHEET**: Look for 'Recognized Income', 'Dept Fee', 'Total Fee', 'Media Spend'.
+    
+    RETURN JSON ONLY:
     {{
-        "h_name": "col_name", 
-        "p_name": "col_name", 
-        "cost_col": "col_name", 
-        "task_col": "col_name",
-        "total_income": 0.0
+        "hours_file_name": "filename",
+        "hours_header_row": 0,
+        "pricing_file_name": "filename",
+        "pricing_header_row": 0,
+        "billing_file_name": "filename",
+        "billing_header_row": 0
     }}
+    If a file is missing, return null for that field.
     """
     try:
         resp = model.generate_content(prompt)
-        return json.loads(resp.text.replace("```json", "").replace("```", "").strip())
+        return json.loads(resp.text)
+    except Exception as e:
+        st.error(f"AI Classification Error: {e}")
+        return None
+
+def extract_data_smart(file, header_row, file_type):
+    """Re-reads the file using the AI-detected header row."""
+    try:
+        file.seek(0) # Reset pointer
+        if file.name.endswith('.csv'):
+            df = pd.read_csv(file, header=header_row)
+        else:
+            df = pd.read_excel(file, header=header_row)
+        return df
     except:
         return None
 
-# --- 4. MAIN APPLICATION ---
+def get_column_mapping(df_h, df_p, df_b):
+    """Asks AI to map the specific column names for joining."""
+    snippet_h = df_h.head(3).to_string()
+    snippet_p = df_p.head(3).to_string()
+    snippet_b = df_b.head(10).to_string()
+
+    prompt = f"""
+    Map these columns for a financial report.
+    
+    HOURS LOG: {snippet_h}
+    PRICING: {snippet_p}
+    BILLING: {snippet_b}
+
+    Identify:
+    1. 'h_name': The Person/Employee column in Hours.
+    2. 'p_name': The Person/Employee column in Pricing.
+    3. 'cost_col': The Cost Rate column in Pricing (Look for 'Cost', 'Rate', 'Hourly').
+    4. 'task_col': The Task/Client column in Hours.
+    5. 'total_revenue': The TOTAL Recognized Revenue/Dept Fee for the current month from Billing (Sum relevant rows if needed). Return a FLOAT.
+
+    JSON ONLY:
+    {{ "h_name": "", "p_name": "", "cost_col": "", "task_col": "", "total_revenue": 0.0 }}
+    """
+    resp = model.generate_content(prompt)
+    return json.loads(resp.text)
+
+# --- 3. MAIN INTERFACE ---
 
 st.title("📊 DEPT Strategic Financial Architect")
-st.markdown("**Reconciliation Engine:** Labor Burn vs. Variable Media Revenue")
+st.markdown("### The Actual Truth Engine")
+st.markdown("Upload **ALL** your account files (Billing, Pricing, Harvest logs). The AI will sort them out.")
 
-# SIDEBAR: The Control Center
-with st.sidebar:
-    st.header("1. Upload Source Data")
-    h_file = st.file_uploader("DEPTapps / Harvest (Hours)", type=['xlsx', 'csv'])
-    p_file = st.file_uploader("CPT / Pricing Plan (Rates)", type=['xlsx', 'csv'])
-    b_file = st.file_uploader("Billing Worksheet (Income)", type=['xlsx', 'csv'])
-    
-    st.divider()
-    st.header("2. Strategic Filters")
-    # Default filters based on your report requirements
-    excluded_tasks = st.multiselect(
-        "Exclude Workstreams", 
-        ['SEO', 'Data Science', 'Strategy', 'Paid Social'],
-        default=['SEO', 'Data Science']
-    )
+# 1. UNIVERSAL UPLOAD ZONE
+uploaded_files = st.file_uploader("Drop all files here (Excel/CSV)", accept_multiple_files=True)
 
-if h_file and p_file and b_file:
-    # A. LOAD DATA
-    df_h = load_file(h_file)
-    df_p = load_file(p_file)
-    df_b = load_file(b_file)
+if uploaded_files:
+    # A. PREVIEW PHASE
+    file_map = {f.name: f for f in uploaded_files}
+    previews = {name: read_file_preview(f) for name, f in file_map.items()}
 
-    # B. AI MAPPING (The "Smart" Layer)
-    with st.spinner("🤖 AI is analyzing file structures and reconciling income..."):
-        mapping = get_ai_mapping(df_h, df_p, df_b)
-    
-    if mapping:
-        # C. DATA PROCESSING
-        # 1. Normalize Names for Merging
-        df_h['join_key'] = df_h[mapping['h_name']].apply(normalize)
-        df_p['join_key'] = df_p[mapping['p_name']].apply(normalize)
+    if st.button("Analyze & Reconcile Files") or True: # Auto-run
+        with st.spinner("🧠 AI is analyzing file types and structures..."):
+            # Step 1: Identify which file is which
+            structure = identify_files_with_ai(previews)
         
-        # 2. Merge Hours with Cost Rates
-        merged = pd.merge(df_h, df_p, on='join_key', how='left')
-        
-        # 3. Calculate Burn
-        # Fill missing rates with 0 to detect Ghosts later
-        cost_col = mapping['cost_col']
-        merged[cost_col] = pd.to_numeric(merged[cost_col], errors='coerce').fillna(0)
-        merged['Burn'] = merged['Hours'] * merged[cost_col]
-        
-        # 4. Apply Filters (The "Logic Gate")
-        # We filter out rows where the Task column contains the excluded keywords
-        task_col = mapping['task_col']
-        # Safe filter: only keep rows where Task does NOT contain excluded terms
-        pattern = '|'.join(excluded_tasks) if excluded_tasks else "ZZZZZ" # ZZZZZ matches nothing
-        filtered_df = merged[~merged[task_col].astype(str).str.contains(pattern, case=False, na=False)]
+        if structure:
+            # Step 2: Extract Data using intelligent headers
+            try:
+                # Load Hours
+                f_h = file_map.get(structure['hours_file_name'])
+                df_h = extract_data_smart(f_h, structure['hours_header_row'], "HOURS")
 
-        # 5. Financial Totals
-        total_income = mapping['total_income']
-        total_burn = filtered_df['Burn'].sum()
-        margin_dollars = total_income - total_burn
-        margin_pct = (margin_dollars / total_income) * 100
-        target_margin = 60.0
+                # Load Pricing
+                f_p = file_map.get(structure['pricing_file_name'])
+                df_p = extract_data_smart(f_p, structure['pricing_header_row'], "PRICING")
 
-        # --- D. DASHBOARD UI (REPLICATING YOUR PPT) ---
+                # Load Billing
+                f_b = file_map.get(structure['billing_file_name'])
+                df_b = extract_data_smart(f_b, structure['billing_header_row'], "BILLING")
 
-        # ZONE 1: EXECUTIVE PULSE
-        st.subheader("1. Executive Pulse")
-        c1, c2, c3 = st.columns(3)
-        
-        with c1:
-            st.metric("Recognized Income (Billing)", f"${total_income:,.0f}", delta="From Billing Worksheet")
-        with c2:
-            st.metric("Total Labor Burn", f"${total_burn:,.0f}", delta=f"{total_burn/total_income*100:.1f}% of Rev", delta_color="inverse")
-        with c3:
-            st.metric("Net Margin %", f"{margin_pct:.1f}%", delta=f"{margin_pct - target_margin:.1f}% vs Target")
+                st.success(f"✅ Identified: **Hours** ({f_h.name}), **Pricing** ({f_p.name}), **Billing** ({f_b.name})")
 
-        # ZONE 2: THE PROFITABILITY GAP (Chart)
-        st.divider()
-        c_chart, c_table = st.columns([2, 1])
-        
-        with c_chart:
-            st.subheader("2. The Profitability Gap")
-            # Creating a clean bar chart like your React mockup
-            chart_data = pd.DataFrame({
-                "Metric": ["Revenue", "Labor Burn"],
-                "Amount": [total_income, total_burn],
-                "Color": ["#6366f1", "#f43f5e"] # Indigo and Rose
-            })
-            fig = px.bar(chart_data, x="Metric", y="Amount", color="Metric", 
-                         color_discrete_map={"Revenue": "#6366f1", "Labor Burn": "#f43f5e"},
-                         text_auto='.2s', title="Revenue vs. Cost Reality")
-            fig.update_layout(showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-            st.plotly_chart(fig, use_container_width=True)
+                # Step 3: Map Columns & Calc
+                with st.spinner("💰 AI is extracting revenue and mapping cost rates..."):
+                    mapping = get_column_mapping(df_h, df_p, df_b)
 
-        with c_table:
-            st.subheader("Workstream Breakdown")
-            # Group by Task/Role to show where the money is going
-            ws_data = filtered_df.groupby(task_col)[['Hours', 'Burn']].sum().sort_values('Burn', ascending=False).head(5)
-            st.dataframe(ws_data.style.format({"Burn": "${:,.0f}", "Hours": "{:,.1f}"}), use_container_width=True)
-
-        # ZONE 3: THE AUDIT (GHOSTS & DRIFT)
-        st.divider()
-        st.subheader("3. Strategic Audit & Anomaly Detection")
-        
-        audit_c1, audit_c2 = st.columns(2)
-        
-        with audit_c1:
-            st.markdown("### 👻 Ghost Team Detector")
-            st.caption("Staff billing time but MISSING from CPT Cost Table")
-            # Ghosts are people with 0 Cost Rate (failed merge) but > 0 Hours
-            ghosts = merged[(merged[cost_col] == 0) & (merged['Hours'] > 0)]
-            if not ghosts.empty:
-                st.dataframe(ghosts[[mapping['h_name'], 'Hours', task_col]].groupby(mapping['h_name']).sum())
-            else:
-                st.success("No Ghost Team members detected.")
-
-        with audit_c2:
-            st.markdown("### 📉 Seniority Drift")
-            st.caption("High-Cost Staff (>$150/hr) doing Admin/Reporting")
-            # Logic: Cost > 150 AND Task contains 'Admin' or 'Report'
-            high_cost = filtered_df[filtered_df[cost_col] > 150]
-            drift = high_cost[high_cost[task_col].str.contains("Admin|Report|Internal|Meeting", case=False, na=False)]
-            
-            if not drift.empty:
-                drift_summary = drift.groupby(mapping['h_name'])[['Hours', 'Burn']].sum().sort_values('Burn', ascending=False)
-                st.dataframe(drift_summary.style.format({"Burn": "${:,.0f}"}))
-            else:
-                st.success("No significant seniority drift detected.")
-
-        # ZONE 4: AI EXECUTIVE SUMMARY
-        st.divider()
-        if st.button("Generate Senior Executive Summary"):
-            with st.spinner("Analyzing financial narrative..."):
-                summary_prompt = f"""
-                You are a Financial Controller. Write a 3-bullet executive summary based on this data:
-                - Income: ${total_income}
-                - Burn: ${total_burn}
-                - Margin: {margin_pct}% (Target: 60%)
-                - Top Burn Driver: {ws_data.index[0]} (${ws_data.iloc[0]['Burn']})
+                # --- B. THE FINANCIAL ENGINE ---
                 
-                Focus on the 'Turnaround Story' or 'Risk Factors'. Be concise and professional.
-                """
-                summary = model.generate_content(summary_prompt).text
-                st.info(summary)
-            
-    else:
-        st.error("Could not interpret file structure. Please ensure columns have clear headers like 'Person', 'Hours', 'Rate'.")
+                # 1. Normalize & Merge
+                h_col = mapping['h_name']
+                p_col = mapping['p_name']
+                cost_col = mapping['cost_col']
+                
+                df_h['clean_name'] = df_h[h_col].astype(str).str.lower().str.strip()
+                df_p['clean_name'] = df_p[p_col].astype(str).str.lower().str.strip()
+                
+                merged = pd.merge(df_h, df_p, on='clean_name', how='left')
+                
+                # 2. Burn Calculation
+                # Clean cost rate (remove '$', handle errors)
+                merged[cost_col] = pd.to_numeric(merged[cost_col].astype(str).str.replace('$', '', regex=False), errors='coerce').fillna(0)
+                merged['Burn'] = merged['Hours'] * merged[cost_col]
 
-else:
-    # LANDING PAGE STATE
-    st.info("👋 Welcome to the DEPT Financial Engine. Upload your monthly files to begin the strategic audit.")
+                # 3. Filter Logic (Exclude SEO/Data Science)
+                task_col = mapping['task_col']
+                active_work = merged[~merged[task_col].astype(str).str.contains("SEO|Data Science", case=False, na=False)]
+
+                # 4. Final Totals
+                total_rev = mapping['total_revenue']
+                total_burn = active_work['Burn'].sum()
+                margin = total_rev - total_burn
+                margin_pct = (margin / total_rev) * 100 if total_rev else 0
+
+                # --- C. DASHBOARD VISUALS ---
+                
+                st.markdown("---")
+                # KPI ROW
+                k1, k2, k3 = st.columns(3)
+                k1.metric("Recognized Revenue", f"${total_rev:,.0f}")
+                k2.metric("Total Labor Burn", f"${total_burn:,.0f}", delta=f"{(total_burn/total_rev)*100:.1f}% Burn Rate", delta_color="inverse")
+                k3.metric("Net Margin %", f"{margin_pct:.1f}%", delta=f"{margin_pct-60:.1f}% vs Target (60%)")
+
+                # CHART ROW
+                c_chart, c_audit = st.columns([2, 1])
+                
+                with c_chart:
+                    st.subheader("Profitability Gap")
+                    chart_df = pd.DataFrame({
+                        "Type": ["Revenue", "Labor Burn"],
+                        "Amount": [total_rev, total_burn],
+                        "Color": ["#6366f1", "#f43f5e"]
+                    })
+                    fig = px.bar(chart_df, x="Type", y="Amount", color="Type", 
+                                 text_auto="$.2s", title="Revenue vs. Cost Reality",
+                                 color_discrete_map={"Revenue": "#6366f1", "Labor Burn": "#f43f5e"})
+                    st.plotly_chart(fig, use_container_width=True)
+
+                with c_audit:
+                    st.subheader("Strategic Audit")
+                    # GHOST TEAM (0 Cost Rate)
+                    ghosts = merged[(merged[cost_col] == 0) & (merged['Hours'] > 0)]
+                    if not ghosts.empty:
+                        st.error(f"👻 {len(ghosts['clean_name'].unique())} Ghost Members Detected")
+                        st.dataframe(ghosts.groupby(h_col)['Hours'].sum().reset_index().sort_values('Hours', ascending=False), height=200)
+                    else:
+                        st.success("No Ghost Team detected.")
+
+                # SENIORITY DRIFT
+                st.subheader("Seniority Drift Analysis")
+                seniors = merged[merged[cost_col] >= 150]
+                drift = seniors[seniors[task_col].astype(str).str.contains("Admin|Report|Internal", case=False, na=False)]
+                
+                if not drift.empty:
+                    st.warning("⚠️ High-Cost Staff performing Low-Value Tasks")
+                    st.dataframe(drift.groupby([h_col, task_col])['Hours'].sum().reset_index())
+
+            except Exception as e:
+                st.error(f"Processing Error: {e}. AI successfully identified files but failed to parse data rows.")
+        else:
+            st.warning("Could not identify files. Please ensure you uploaded Hours, Pricing, and Billing files.")
