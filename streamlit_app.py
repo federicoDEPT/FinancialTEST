@@ -4,12 +4,10 @@ import numpy as np
 from io import BytesIO
 import json
 from google import genai
-from google.genai import types
 from datetime import datetime
 import plotly.graph_objects as go
 import plotly.express as px
 from scipy import stats
-import base64
 
 # Page config
 st.set_page_config(
@@ -32,260 +30,195 @@ def init_gemini():
 
 client = init_gemini()
 
-# Helper Functions
-def excel_to_base64(file):
-    """Convert Excel file to base64 for Gemini API"""
-    return base64.b64encode(file.getvalue()).decode()
-
-def interpret_excel_file(file, client):
-    """Use Gemini to understand the Excel file structure"""
+def identify_file_type(df, filename, client):
+    """Use Gemini to identify what type of file this is"""
     
-    prompt = f"""Analyze this Excel file and identify:
-    1. What type of financial data it contains (CPT Plan / Harvest Hours / Financial Income / Other)
-    2. The column headers and their meanings
-    3. The structure of the data (which columns are dates, names, hours, rates, amounts, etc.)
-    4. Any important metadata or context
+    # Get sample of data
+    sample = df.head(10).to_string()
+    columns = ", ".join(df.columns.tolist())
     
-    Return your analysis as a JSON object with this structure:
-    {{
-        "file_type": "CPT_PLAN" | "HARVEST_DATA" | "FINANCIAL_INCOME" | "OTHER",
-        "description": "brief description of contents",
-        "columns": {{
-            "column_name": "interpretation"
-        }},
-        "date_columns": ["list", "of", "date", "columns"],
-        "key_metrics": ["hours", "rate", "cost", etc],
-        "team_members": ["if identifiable"],
-        "date_range": "if identifiable"
-    }}
-    
-    Be thorough and precise."""
-    
-    try:
-        # Read first sheet to show to AI
-        df = pd.read_excel(file, sheet_name=0, nrows=10)
-        file_preview = df.to_string()
-        
-        full_prompt = f"{prompt}\n\nFile preview (first 10 rows):\n{file_preview}"
-        
-        response = client.models.generate_content(
-            model='gemini-2.0-flash-exp',
-            contents=full_prompt
-        )
-        
-        # Parse JSON from response
-        response_text = response.text.strip()
-        if "```json" in response_text:
-            response_text = response_text.split("```json")[1].split("```")[0]
-        
-        return json.loads(response_text)
-    except Exception as e:
-        st.error(f"Error interpreting file: {e}")
-        return None
+    prompt = f"""Analyze this Excel file and identify its type.
 
-def process_files(uploaded_files, client):
-    """Process all uploaded files and extract structured data"""
-    
-    processed_data = {
-        "cpt_plan": None,
-        "harvest_data": None,
-        "financial_income": None,
-        "interpretations": []
-    }
-    
-    for file in uploaded_files:
-        st.write(f"🔍 Analyzing: **{file.name}**")
-        
-        # Interpret file
-        interpretation = interpret_excel_file(file, client)
-        
-        if interpretation:
-            processed_data["interpretations"].append({
-                "filename": file.name,
-                "interpretation": interpretation
-            })
-            
-            # Read the actual data
-            df = pd.read_excel(file)
-            
-            # Store based on type
-            file_type = interpretation.get("file_type", "OTHER")
-            if file_type == "CPT_PLAN":
-                processed_data["cpt_plan"] = df
-            elif file_type == "HARVEST_DATA":
-                processed_data["harvest_data"] = df
-            elif file_type == "FINANCIAL_INCOME":
-                processed_data["financial_income"] = df
-            
-            st.success(f"✓ Identified as: {file_type}")
-        
-        file.seek(0)  # Reset file pointer
-    
-    return processed_data
+Filename: {filename}
+Columns: {columns}
 
-def calculate_correlations(hours_data, financial_data):
-    """Calculate correlation between hours and financial metrics"""
-    
-    try:
-        # Merge datasets
-        merged = pd.merge(
-            hours_data[['month', 'total_hours']],
-            financial_data[['month', 'burned_value', 'income']],
-            on='month'
-        )
-        
-        # Calculate variance
-        merged['hours_variance'] = merged['total_hours'] - merged['total_hours'].mean()
-        merged['financial_delta'] = merged['burned_value'] - merged['income']
-        
-        # Correlations
-        corr_absolute = np.corrcoef(
-            merged['total_hours'].abs(),
-            merged['financial_delta'].abs()
-        )[0, 1]
-        
-        corr_variance = np.corrcoef(
-            merged['hours_variance'],
-            merged['financial_delta']
-        )[0, 1]
-        
-        return {
-            "hours_vs_burn_absolute": round(corr_absolute, 2),
-            "hours_variance_vs_delta": round(corr_variance, 2)
-        }
-    except Exception as e:
-        st.error(f"Correlation calculation error: {e}")
-        return None
+Sample data:
+{sample}
 
-def generate_financial_analysis(processed_data, client):
-    """Use Gemini to generate comprehensive financial analysis"""
-    
-    # Prepare data summary for AI - convert to string to avoid JSON serialization issues
-    def df_to_summary(df):
-        if df is None:
-            return "Not provided"
-        return df.head(20).to_string()
-    
-    data_context = f"""
-CPT PLAN DATA:
-{df_to_summary(processed_data["cpt_plan"])}
+Is this:
+A) CPT_PLAN - Contains planned hours, team member names, roles, rates
+B) HARVEST_DATA - Contains logged/tracked hours, actual time entries
+C) FINANCIAL_INCOME - Contains revenue, income, monthly financial data
 
-HARVEST DATA:
-{df_to_summary(processed_data["harvest_data"])}
-
-FINANCIAL INCOME DATA:
-{df_to_summary(processed_data["financial_income"])}
-"""
-    
-    prompt = f"""You are a senior financial analyst at DEPT agency. Analyze this financial data and generate a comprehensive report.
-
-DATA PROVIDED:
-{data_context}
-
-Generate a detailed financial analysis following this structure:
-
-1. EXECUTIVE SUMMARY
-   - Financial status (cumulative profit/loss)
-   - Revenue efficiency (% of labor value recovered as income)
-   - Primary drivers of performance
-   - Key risks
-
-2. METHODOLOGY
-   - Correlation analysis (hours vs financial burn)
-   - Why financial analysis matters beyond hours
-   - Case studies showing seniority drift
-
-3. MONTHLY BREAKDOWN
-   - Month-by-month profitability
-   - Burned labor value vs DEPT income
-   - Efficiency percentage
-   - Trend analysis
-
-4. TEAM-LEVEL ANALYSIS
-   - Hours variance by team
-   - Financial impact per team
-   - Seniority drift detection
-   - Staff swap analysis
-
-5. STRATEGIC RECOMMENDATIONS
-   - Contractual adjustments needed
-   - Fee structure changes
-   - Operational improvements
-   - 2026 action plan
-
-Return as structured JSON with sections and insights. Be specific with numbers and percentages."""
+Respond with ONLY one word: CPT_PLAN, HARVEST_DATA, or FINANCIAL_INCOME"""
 
     try:
         response = client.models.generate_content(
             model='gemini-2.0-flash-exp',
             contents=prompt
         )
-        response_text = response.text.strip()
-        
-        if "```json" in response_text:
-            response_text = response_text.split("```json")[1].split("```")[0]
-        
-        return json.loads(response_text)
+        file_type = response.text.strip().upper()
+        return file_type if file_type in ["CPT_PLAN", "HARVEST_DATA", "FINANCIAL_INCOME"] else "OTHER"
     except Exception as e:
-        st.error(f"Analysis generation error: {e}")
+        st.warning(f"Could not identify file type: {e}")
+        return "OTHER"
+
+def process_cpt_data(df):
+    """Extract planned hours and rates from CPT plan"""
+    try:
+        # Try to find columns with hours and rates
+        data = {
+            'total_planned_hours': 0,
+            'total_planned_cost': 0,
+            'team_breakdown': []
+        }
+        
+        # Look for numeric columns
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        
+        if len(numeric_cols) > 0:
+            # Sum all numeric values as rough estimate
+            for col in numeric_cols:
+                if 'hour' in col.lower() or 'time' in col.lower():
+                    data['total_planned_hours'] += df[col].sum()
+                if 'rate' in col.lower() or 'cost' in col.lower() or 'price' in col.lower():
+                    data['total_planned_cost'] += df[col].sum()
+        
+        return data
+    except Exception as e:
+        st.warning(f"Error processing CPT data: {e}")
         return None
 
-def create_profitability_chart(monthly_data):
-    """Create monthly profitability visualization"""
+def process_harvest_data(df):
+    """Extract actual hours from Harvest data"""
+    try:
+        data = {
+            'total_actual_hours': 0,
+            'monthly_hours': {},
+            'team_hours': {}
+        }
+        
+        # Find date and hours columns
+        date_cols = [col for col in df.columns if 'date' in col.lower() or 'month' in col.lower()]
+        hour_cols = [col for col in df.columns if 'hour' in col.lower() or 'time' in col.lower()]
+        
+        if hour_cols:
+            data['total_actual_hours'] = df[hour_cols[0]].sum()
+        
+        # Try to group by month if date column exists
+        if date_cols and hour_cols:
+            df['date_parsed'] = pd.to_datetime(df[date_cols[0]], errors='coerce')
+            df['month'] = df['date_parsed'].dt.to_period('M')
+            monthly = df.groupby('month')[hour_cols[0]].sum()
+            data['monthly_hours'] = {str(k): v for k, v in monthly.items()}
+        
+        return data
+    except Exception as e:
+        st.warning(f"Error processing Harvest data: {e}")
+        return None
+
+def process_financial_data(df):
+    """Extract revenue and income data"""
+    try:
+        data = {
+            'total_income': 0,
+            'monthly_income': {},
+            'total_cost': 0
+        }
+        
+        # Find relevant columns
+        income_cols = [col for col in df.columns if 'income' in col.lower() or 'revenue' in col.lower()]
+        cost_cols = [col for col in df.columns if 'cost' in col.lower() or 'expense' in col.lower() or 'burn' in col.lower()]
+        
+        if income_cols:
+            data['total_income'] = df[income_cols[0]].sum()
+        if cost_cols:
+            data['total_cost'] = df[cost_cols[0]].sum()
+        
+        return data
+    except Exception as e:
+        st.warning(f"Error processing financial data: {e}")
+        return None
+
+def generate_ai_insights(data_summary, client):
+    """Generate insights using Gemini"""
+    
+    prompt = f"""You are a financial analyst at DEPT agency. Analyze this data and provide insights.
+
+DATA:
+{data_summary}
+
+Provide 5 key insights about:
+1. Overall financial health
+2. Efficiency (actual vs planned hours)
+3. Revenue performance
+4. Key risks
+5. Recommendations
+
+Format as a numbered list. Be specific and actionable."""
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.0-flash-exp',
+            contents=prompt
+        )
+        return response.text
+    except Exception as e:
+        return f"Error generating insights: {e}"
+
+def create_efficiency_gauge(efficiency_pct):
+    """Create a gauge chart for revenue efficiency"""
+    
+    fig = go.Figure(go.Indicator(
+        mode = "gauge+number+delta",
+        value = efficiency_pct,
+        domain = {'x': [0, 1], 'y': [0, 1]},
+        title = {'text': "Revenue Efficiency"},
+        delta = {'reference': 100},
+        gauge = {
+            'axis': {'range': [None, 150]},
+            'bar': {'color': "darkblue"},
+            'steps': [
+                {'range': [0, 60], 'color': "#ffcccc"},
+                {'range': [60, 90], 'color': "#ffffcc"},
+                {'range': [90, 110], 'color': "#ccffcc"},
+                {'range': [110, 150], 'color': "#99ff99"}
+            ],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': 100
+            }
+        }
+    ))
+    
+    fig.update_layout(height=300)
+    return fig
+
+def create_variance_chart(planned, actual, label):
+    """Create a comparison chart"""
     
     fig = go.Figure()
     
     fig.add_trace(go.Bar(
-        x=monthly_data['month'],
-        y=monthly_data['burned_value'],
-        name='Burned Labor Value',
+        x=[label],
+        y=[planned],
+        name='Planned',
+        marker_color='#3498DB'
+    ))
+    
+    fig.add_trace(go.Bar(
+        x=[label],
+        y=[actual],
+        name='Actual',
         marker_color='#E74C3C'
     ))
     
-    fig.add_trace(go.Bar(
-        x=monthly_data['month'],
-        y=monthly_data['income'],
-        name='DEPT Income',
-        marker_color='#27AE60'
-    ))
-    
     fig.update_layout(
-        title='Monthly Profitability: Burned Value vs Income',
-        xaxis_title='Month',
-        yaxis_title='Amount ($)',
+        title=f'{label}: Planned vs Actual',
         barmode='group',
-        template='plotly_white',
-        height=400
-    )
-    
-    return fig
-
-def create_efficiency_chart(monthly_data):
-    """Create revenue efficiency trend chart"""
-    
-    monthly_data['efficiency'] = (monthly_data['income'] / monthly_data['burned_value'] * 100).round(0)
-    
-    fig = go.Figure()
-    
-    fig.add_trace(go.Scatter(
-        x=monthly_data['month'],
-        y=monthly_data['efficiency'],
-        mode='lines+markers',
-        line=dict(color='#3498DB', width=3),
-        marker=dict(size=10),
-        fill='tozeroy',
-        fillcolor='rgba(52, 152, 219, 0.1)'
-    ))
-    
-    fig.add_hline(y=100, line_dash="dash", line_color="gray", 
-                  annotation_text="Break-even (100%)")
-    
-    fig.update_layout(
-        title='Revenue Efficiency Trend (%)',
-        xaxis_title='Month',
-        yaxis_title='Efficiency (%)',
-        template='plotly_white',
-        height=400
+        height=300,
+        showlegend=True
     )
     
     return fig
@@ -295,31 +228,21 @@ def main():
     st.title("📊 DEPT Financial Report Generator")
     st.markdown("### AI-Powered Multi-Account Financial Analysis")
     
-    st.markdown("""
-    **Upload your financial files to generate comprehensive reports including:**
-    - Executive Summary with KPIs
-    - Correlation & Methodology Analysis
-    - Monthly Profitability Breakdown
-    - Team-Level Performance Scorecards
-    - Strategic Recommendations
-    """)
-    
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Configuration")
-        
         account_name = st.text_input("Account Name", "Client Account")
         report_period = st.text_input("Report Period", "2025")
         
         st.markdown("---")
-        st.markdown("**File Upload Guidelines:**")
+        st.markdown("**About This Tool:**")
         st.info("""
-        Upload any combination of:
-        - CPT Plan (planned hours/team)
-        - Harvest Data (logged hours)
-        - Financial Income (monthly revenue)
-        
-        Files can have any format - AI will interpret them.
+        Upload your financial files to generate:
+        - Executive Summary
+        - Financial Health Analysis
+        - Team Performance Metrics
+        - AI-Powered Insights
+        - Strategic Recommendations
         """)
     
     # File Upload
@@ -334,167 +257,225 @@ def main():
         
         if st.button("🚀 Generate Financial Report", type="primary"):
             
-            with st.spinner("Processing files with AI..."):
-                # Process files
-                processed_data = process_files(uploaded_files, client)
+            # Process files
+            with st.spinner("🔍 Analyzing files..."):
                 
-                st.success(f"✓ Processed {len(uploaded_files)} files successfully")
-            
-            # Show interpretations
-            with st.expander("📋 File Interpretations", expanded=False):
-                for item in processed_data["interpretations"]:
-                    st.markdown(f"**{item['filename']}**")
-                    st.json(item['interpretation'])
-            
-            # Generate analysis
-            with st.spinner("Generating financial analysis..."):
-                analysis = generate_financial_analysis(processed_data, client)
-            
-            if analysis:
-                # Display Report
-                st.markdown("---")
-                st.header(f"📑 Financial Report: {account_name} {report_period}")
-                
-                # Executive Summary
-                st.markdown("## 🎯 Executive Summary")
-                if "executive_summary" in analysis:
-                    summary = analysis["executive_summary"]
-                    
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric(
-                            "Financial Status",
-                            summary.get("cumulative_loss", "N/A"),
-                            delta=summary.get("trend", ""),
-                            delta_color="inverse"
-                        )
-                    with col2:
-                        st.metric(
-                            "Revenue Efficiency",
-                            summary.get("efficiency", "N/A"),
-                        )
-                    with col3:
-                        st.metric(
-                            "Primary Risk",
-                            summary.get("risk_level", "N/A")
-                        )
-                    
-                    st.markdown(summary.get("narrative", ""))
-                
-                # Methodology
-                st.markdown("## 🔬 Methodology")
-                if "methodology" in analysis:
-                    st.markdown(analysis["methodology"].get("explanation", ""))
-                    
-                    # Correlation table
-                    if "correlations" in analysis["methodology"]:
-                        st.markdown("### Correlation Analysis")
-                        corr_df = pd.DataFrame(analysis["methodology"]["correlations"])
-                        st.dataframe(corr_df, use_container_width=True)
-                
-                # Monthly Breakdown
-                st.markdown("## 📅 Monthly Breakdown")
-                if "monthly_breakdown" in analysis:
-                    monthly_df = pd.DataFrame(analysis["monthly_breakdown"])
-                    
-                    # Show table
-                    st.dataframe(
-                        monthly_df.style.format({
-                            'burned_value': '${:,.0f}',
-                            'income': '${:,.0f}',
-                            'efficiency': '{:.0f}%',
-                            'profit_loss': '${:,.0f}'
-                        }),
-                        use_container_width=True
-                    )
-                    
-                    # Charts
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.plotly_chart(
-                            create_profitability_chart(monthly_df),
-                            use_container_width=True
-                        )
-                    with col2:
-                        st.plotly_chart(
-                            create_efficiency_chart(monthly_df),
-                            use_container_width=True
-                        )
-                
-                # Team Analysis
-                st.markdown("## 👥 Team-Level Analysis")
-                if "team_analysis" in analysis:
-                    team_df = pd.DataFrame(analysis["team_analysis"])
-                    st.dataframe(team_df, use_container_width=True)
-                
-                # Recommendations
-                st.markdown("## 💡 Strategic Recommendations")
-                if "recommendations" in analysis:
-                    for i, rec in enumerate(analysis["recommendations"], 1):
-                        st.markdown(f"**{i}. {rec.get('title', '')}**")
-                        st.markdown(rec.get('description', ''))
-                        st.markdown("")
-                
-                # Export
-                st.markdown("---")
-                st.markdown("### 📥 Export Report")
-                
-                # Generate JSON export
-                export_data = {
-                    "account": account_name,
-                    "period": report_period,
-                    "generated": datetime.now().isoformat(),
-                    "analysis": analysis,
-                    "raw_data": {
-                        "files_processed": len(uploaded_files),
-                        "interpretations": processed_data["interpretations"]
-                    }
+                file_data = {
+                    'cpt_plan': None,
+                    'harvest_data': None,
+                    'financial_income': None
                 }
                 
-                json_export = json.dumps(export_data, indent=2)
+                for file in uploaded_files:
+                    df = pd.read_excel(file)
+                    file_type = identify_file_type(df, file.name, client)
+                    
+                    st.write(f"**{file.name}**: Identified as `{file_type}`")
+                    
+                    if file_type == "CPT_PLAN":
+                        file_data['cpt_plan'] = df
+                    elif file_type == "HARVEST_DATA":
+                        file_data['harvest_data'] = df
+                    elif file_type == "FINANCIAL_INCOME":
+                        file_data['financial_income'] = df
+            
+            # Extract metrics
+            with st.spinner("📊 Extracting metrics..."):
                 
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.download_button(
-                        label="📄 Download JSON Report",
-                        data=json_export,
-                        file_name=f"financial_report_{account_name}_{report_period}.json",
-                        mime="application/json"
+                cpt_metrics = process_cpt_data(file_data['cpt_plan']) if file_data['cpt_plan'] is not None else {}
+                harvest_metrics = process_harvest_data(file_data['harvest_data']) if file_data['harvest_data'] is not None else {}
+                financial_metrics = process_financial_data(file_data['financial_income']) if file_data['financial_income'] is not None else {}
+                
+                # Calculate key metrics
+                planned_hours = cpt_metrics.get('total_planned_hours', 0)
+                actual_hours = harvest_metrics.get('total_actual_hours', 0)
+                planned_cost = cpt_metrics.get('total_planned_cost', 0)
+                total_income = financial_metrics.get('total_income', 0)
+                total_cost = financial_metrics.get('total_cost', 0)
+                
+                # Calculate efficiency
+                if total_cost > 0:
+                    efficiency = (total_income / total_cost * 100)
+                else:
+                    efficiency = 0
+                
+                # Hours variance
+                if planned_hours > 0:
+                    hours_variance = ((actual_hours - planned_hours) / planned_hours * 100)
+                else:
+                    hours_variance = 0
+                
+                # Profit/Loss
+                profit_loss = total_income - total_cost
+            
+            # Display Report
+            st.markdown("---")
+            st.header(f"📑 Financial Report: {account_name} {report_period}")
+            
+            # Executive Summary
+            st.markdown("## 🎯 Executive Summary")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric(
+                    "Total Income",
+                    f"${total_income:,.0f}",
+                    delta=f"${profit_loss:,.0f}" if profit_loss != 0 else None
+                )
+            
+            with col2:
+                st.metric(
+                    "Total Cost",
+                    f"${total_cost:,.0f}"
+                )
+            
+            with col3:
+                st.metric(
+                    "Revenue Efficiency",
+                    f"{efficiency:.1f}%",
+                    delta=f"{efficiency - 100:.1f}%" if efficiency > 0 else None,
+                    delta_color="normal" if efficiency >= 100 else "inverse"
+                )
+            
+            with col4:
+                st.metric(
+                    "Hours Variance",
+                    f"{hours_variance:+.1f}%",
+                    delta_color="inverse" if hours_variance > 0 else "normal"
+                )
+            
+            # Financial Status
+            if profit_loss >= 0:
+                st.success(f"✅ **Profitable**: +${profit_loss:,.0f}")
+            else:
+                st.error(f"⚠️ **Loss**: ${profit_loss:,.0f}")
+            
+            # Visualizations
+            st.markdown("## 📈 Key Metrics")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.plotly_chart(
+                    create_efficiency_gauge(efficiency),
+                    use_container_width=True
+                )
+            
+            with col2:
+                if planned_hours > 0 and actual_hours > 0:
+                    st.plotly_chart(
+                        create_variance_chart(planned_hours, actual_hours, "Hours"),
+                        use_container_width=True
                     )
-                with col2:
-                    st.info("PDF export coming soon - use Print to PDF from browser")
+            
+            # Monthly breakdown if available
+            if harvest_metrics.get('monthly_hours'):
+                st.markdown("## 📅 Monthly Breakdown")
+                
+                monthly_df = pd.DataFrame([
+                    {'Month': k, 'Hours': v}
+                    for k, v in harvest_metrics['monthly_hours'].items()
+                ])
+                
+                fig = px.line(
+                    monthly_df,
+                    x='Month',
+                    y='Hours',
+                    title='Monthly Hours Trend',
+                    markers=True
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.dataframe(monthly_df, use_container_width=True)
+            
+            # AI Insights
+            st.markdown("## 💡 AI-Powered Insights")
+            
+            with st.spinner("🤖 Generating insights..."):
+                data_summary = f"""
+                Total Income: ${total_income:,.0f}
+                Total Cost: ${total_cost:,.0f}
+                Profit/Loss: ${profit_loss:,.0f}
+                Revenue Efficiency: {efficiency:.1f}%
+                Planned Hours: {planned_hours:,.0f}
+                Actual Hours: {actual_hours:,.0f}
+                Hours Variance: {hours_variance:+.1f}%
+                """
+                
+                insights = generate_ai_insights(data_summary, client)
+                st.markdown(insights)
+            
+            # Data Tables
+            st.markdown("## 📋 Data Tables")
+            
+            tabs = st.tabs(["CPT Plan", "Harvest Data", "Financial Income"])
+            
+            with tabs[0]:
+                if file_data['cpt_plan'] is not None:
+                    st.dataframe(file_data['cpt_plan'], use_container_width=True)
+                else:
+                    st.info("No CPT Plan data uploaded")
+            
+            with tabs[1]:
+                if file_data['harvest_data'] is not None:
+                    st.dataframe(file_data['harvest_data'], use_container_width=True)
+                else:
+                    st.info("No Harvest data uploaded")
+            
+            with tabs[2]:
+                if file_data['financial_income'] is not None:
+                    st.dataframe(file_data['financial_income'], use_container_width=True)
+                else:
+                    st.info("No Financial Income data uploaded")
+            
+            # Export
+            st.markdown("---")
+            st.markdown("### 📥 Export Report")
+            
+            report_summary = {
+                "account": account_name,
+                "period": report_period,
+                "generated": datetime.now().isoformat(),
+                "metrics": {
+                    "total_income": total_income,
+                    "total_cost": total_cost,
+                    "profit_loss": profit_loss,
+                    "efficiency": efficiency,
+                    "planned_hours": planned_hours,
+                    "actual_hours": actual_hours,
+                    "hours_variance": hours_variance
+                }
+            }
+            
+            st.download_button(
+                label="📄 Download JSON Report",
+                data=json.dumps(report_summary, indent=2),
+                file_name=f"financial_report_{account_name}_{report_period}.json",
+                mime="application/json"
+            )
     
     else:
         st.info("👆 Upload your Excel files to get started")
         
-        # Show example
-        with st.expander("📖 See Example Report Structure"):
+        # Example
+        with st.expander("📖 How It Works"):
             st.markdown("""
-            Your report will include:
+            **Step 1:** Upload your financial files
+            - CPT Plan (planned hours & rates)
+            - Harvest Data (actual logged hours)
+            - Financial Income (revenue data)
             
-            **1. Executive Summary**
-            - Financial status overview
+            **Step 2:** AI identifies file types automatically
+            
+            **Step 3:** Get comprehensive analysis:
             - Revenue efficiency metrics
-            - Primary performance drivers
+            - Hours variance analysis
+            - Profit/loss calculations
+            - AI-generated insights
+            - Visual charts and trends
             
-            **2. Methodology**
-            - Correlation analysis (Hours vs Financial Burn)
-            - Seniority mix impact analysis
-            
-            **3. Monthly Breakdown**
-            - Burned labor value vs income
-            - Month-over-month profitability
-            - Efficiency trends
-            
-            **4. Team-Level Deep Dive**
-            - Hours variance by team
-            - Financial impact per team
-            - Seniority drift detection
-            
-            **5. Strategic Recommendations**
-            - Contractual adjustments
-            - Fee structure optimization
-            - 2026 action plan
+            **Step 4:** Export as JSON or print to PDF
             """)
 
 if __name__ == "__main__":
