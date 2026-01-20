@@ -35,7 +35,7 @@ def identify_file_type(df, filename, client):
     
     # Get sample of data
     sample = df.head(10).to_string()
-    columns = ", ".join(df.columns.tolist())
+    columns = ", ".join([str(col) for col in df.columns.tolist()])
     
     prompt = f"""Analyze this Excel file and identify its type.
 
@@ -79,15 +79,16 @@ def process_cpt_data(df):
         if len(numeric_cols) > 0:
             # Sum all numeric values as rough estimate
             for col in numeric_cols:
-                if 'hour' in col.lower() or 'time' in col.lower():
+                col_str = str(col).lower()
+                if 'hour' in col_str or 'time' in col_str:
                     data['total_planned_hours'] += df[col].sum()
-                if 'rate' in col.lower() or 'cost' in col.lower() or 'price' in col.lower():
+                if 'rate' in col_str or 'cost' in col_str or 'price' in col_str:
                     data['total_planned_cost'] += df[col].sum()
         
         return data
     except Exception as e:
         st.warning(f"Error processing CPT data: {e}")
-        return None
+        return {'total_planned_hours': 0, 'total_planned_cost': 0, 'team_breakdown': []}
 
 def process_harvest_data(df):
     """Extract actual hours from Harvest data"""
@@ -99,23 +100,24 @@ def process_harvest_data(df):
         }
         
         # Find date and hours columns
-        date_cols = [col for col in df.columns if 'date' in col.lower() or 'month' in col.lower()]
-        hour_cols = [col for col in df.columns if 'hour' in col.lower() or 'time' in col.lower()]
+        date_cols = [col for col in df.columns if 'date' in str(col).lower() or 'month' in str(col).lower()]
+        hour_cols = [col for col in df.columns if 'hour' in str(col).lower() or 'time' in str(col).lower()]
         
         if hour_cols:
             data['total_actual_hours'] = df[hour_cols[0]].sum()
         
         # Try to group by month if date column exists
         if date_cols and hour_cols:
-            df['date_parsed'] = pd.to_datetime(df[date_cols[0]], errors='coerce')
-            df['month'] = df['date_parsed'].dt.to_period('M')
-            monthly = df.groupby('month')[hour_cols[0]].sum()
-            data['monthly_hours'] = {str(k): v for k, v in monthly.items()}
+            df_copy = df.copy()
+            df_copy['date_parsed'] = pd.to_datetime(df_copy[date_cols[0]], errors='coerce')
+            df_copy['month'] = df_copy['date_parsed'].dt.to_period('M')
+            monthly = df_copy.groupby('month')[hour_cols[0]].sum()
+            data['monthly_hours'] = {str(k): float(v) for k, v in monthly.items()}
         
         return data
     except Exception as e:
         st.warning(f"Error processing Harvest data: {e}")
-        return None
+        return {'total_actual_hours': 0, 'monthly_hours': {}, 'team_hours': {}}
 
 def process_financial_data(df):
     """Extract revenue and income data"""
@@ -127,18 +129,18 @@ def process_financial_data(df):
         }
         
         # Find relevant columns
-        income_cols = [col for col in df.columns if 'income' in col.lower() or 'revenue' in col.lower()]
-        cost_cols = [col for col in df.columns if 'cost' in col.lower() or 'expense' in col.lower() or 'burn' in col.lower()]
+        income_cols = [col for col in df.columns if 'income' in str(col).lower() or 'revenue' in str(col).lower()]
+        cost_cols = [col for col in df.columns if 'cost' in str(col).lower() or 'expense' in str(col).lower() or 'burn' in str(col).lower()]
         
         if income_cols:
-            data['total_income'] = df[income_cols[0]].sum()
+            data['total_income'] = float(df[income_cols[0]].sum())
         if cost_cols:
-            data['total_cost'] = df[cost_cols[0]].sum()
+            data['total_cost'] = float(df[cost_cols[0]].sum())
         
         return data
     except Exception as e:
         st.warning(f"Error processing financial data: {e}")
-        return None
+        return {'total_income': 0, 'monthly_income': {}, 'total_cost': 0}
 
 def generate_ai_insights(data_summary, client):
     """Generate insights using Gemini"""
@@ -282,16 +284,16 @@ def main():
             # Extract metrics
             with st.spinner("📊 Extracting metrics..."):
                 
-                cpt_metrics = process_cpt_data(file_data['cpt_plan']) if file_data['cpt_plan'] is not None else {}
-                harvest_metrics = process_harvest_data(file_data['harvest_data']) if file_data['harvest_data'] is not None else {}
-                financial_metrics = process_financial_data(file_data['financial_income']) if file_data['financial_income'] is not None else {}
+                cpt_metrics = process_cpt_data(file_data['cpt_plan']) if file_data['cpt_plan'] is not None else {'total_planned_hours': 0, 'total_planned_cost': 0}
+                harvest_metrics = process_harvest_data(file_data['harvest_data']) if file_data['harvest_data'] is not None else {'total_actual_hours': 0, 'monthly_hours': {}}
+                financial_metrics = process_financial_data(file_data['financial_income']) if file_data['financial_income'] is not None else {'total_income': 0, 'total_cost': 0}
                 
                 # Calculate key metrics
-                planned_hours = cpt_metrics.get('total_planned_hours', 0)
-                actual_hours = harvest_metrics.get('total_actual_hours', 0)
-                planned_cost = cpt_metrics.get('total_planned_cost', 0)
-                total_income = financial_metrics.get('total_income', 0)
-                total_cost = financial_metrics.get('total_cost', 0)
+                planned_hours = float(cpt_metrics.get('total_planned_hours', 0))
+                actual_hours = float(harvest_metrics.get('total_actual_hours', 0))
+                planned_cost = float(cpt_metrics.get('total_planned_cost', 0))
+                total_income = float(financial_metrics.get('total_income', 0))
+                total_cost = float(financial_metrics.get('total_cost', 0))
                 
                 # Calculate efficiency
                 if total_cost > 0:
@@ -373,21 +375,23 @@ def main():
             if harvest_metrics.get('monthly_hours'):
                 st.markdown("## 📅 Monthly Breakdown")
                 
-                monthly_df = pd.DataFrame([
-                    {'Month': k, 'Hours': v}
-                    for k, v in harvest_metrics['monthly_hours'].items()
-                ])
-                
-                fig = px.line(
-                    monthly_df,
-                    x='Month',
-                    y='Hours',
-                    title='Monthly Hours Trend',
-                    markers=True
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                
-                st.dataframe(monthly_df, use_container_width=True)
+                monthly_data = harvest_metrics['monthly_hours']
+                if monthly_data:
+                    monthly_df = pd.DataFrame([
+                        {'Month': k, 'Hours': v}
+                        for k, v in monthly_data.items()
+                    ])
+                    
+                    fig = px.line(
+                        monthly_df,
+                        x='Month',
+                        y='Hours',
+                        title='Monthly Hours Trend',
+                        markers=True
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    st.dataframe(monthly_df, use_container_width=True)
             
             # AI Insights
             st.markdown("## 💡 AI-Powered Insights")
@@ -438,13 +442,13 @@ def main():
                 "period": report_period,
                 "generated": datetime.now().isoformat(),
                 "metrics": {
-                    "total_income": total_income,
-                    "total_cost": total_cost,
-                    "profit_loss": profit_loss,
-                    "efficiency": efficiency,
-                    "planned_hours": planned_hours,
-                    "actual_hours": actual_hours,
-                    "hours_variance": hours_variance
+                    "total_income": float(total_income),
+                    "total_cost": float(total_cost),
+                    "profit_loss": float(profit_loss),
+                    "efficiency": float(efficiency),
+                    "planned_hours": float(planned_hours),
+                    "actual_hours": float(actual_hours),
+                    "hours_variance": float(hours_variance)
                 }
             }
             
