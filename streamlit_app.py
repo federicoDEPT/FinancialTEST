@@ -3,7 +3,8 @@ import pandas as pd
 import numpy as np
 from io import BytesIO
 import json
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from datetime import datetime
 import plotly.graph_objects as go
 import plotly.express as px
@@ -22,21 +23,21 @@ st.set_page_config(
 def init_gemini():
     try:
         api_key = st.secrets["GEMINI_API_KEY"]
-        genai.configure(api_key=api_key)
-        return genai.GenerativeModel('gemini-1.5-pro')
+        client = genai.Client(api_key=api_key)
+        return client
     except Exception as e:
         st.error(f"Error initializing Gemini API: {e}")
         st.info("Please add your GEMINI_API_KEY to Streamlit secrets")
         return None
 
-model = init_gemini()
+client = init_gemini()
 
 # Helper Functions
 def excel_to_base64(file):
     """Convert Excel file to base64 for Gemini API"""
     return base64.b64encode(file.getvalue()).decode()
 
-def interpret_excel_file(file, model):
+def interpret_excel_file(file, client):
     """Use Gemini to understand the Excel file structure"""
     
     prompt = f"""Analyze this Excel file and identify:
@@ -62,13 +63,15 @@ def interpret_excel_file(file, model):
     
     try:
         # Read first sheet to show to AI
-        df = pd.read_excel(file, nsheet=0, nrows=10)
+        df = pd.read_excel(file, sheet_name=0, nrows=10)
         file_preview = df.to_string()
         
-        response = model.generate_content([
-            prompt,
-            f"\n\nFile preview (first 10 rows):\n{file_preview}"
-        ])
+        full_prompt = f"{prompt}\n\nFile preview (first 10 rows):\n{file_preview}"
+        
+        response = client.models.generate_content(
+            model='gemini-2.0-flash-exp',
+            contents=full_prompt
+        )
         
         # Parse JSON from response
         response_text = response.text.strip()
@@ -80,7 +83,7 @@ def interpret_excel_file(file, model):
         st.error(f"Error interpreting file: {e}")
         return None
 
-def process_files(uploaded_files, model):
+def process_files(uploaded_files, client):
     """Process all uploaded files and extract structured data"""
     
     processed_data = {
@@ -94,7 +97,7 @@ def process_files(uploaded_files, model):
         st.write(f"🔍 Analyzing: **{file.name}**")
         
         # Interpret file
-        interpretation = interpret_excel_file(file, model)
+        interpretation = interpret_excel_file(file, client)
         
         if interpretation:
             processed_data["interpretations"].append({
@@ -154,7 +157,7 @@ def calculate_correlations(hours_data, financial_data):
         st.error(f"Correlation calculation error: {e}")
         return None
 
-def generate_financial_analysis(processed_data, model):
+def generate_financial_analysis(processed_data, client):
     """Use Gemini to generate comprehensive financial analysis"""
     
     # Prepare data summary for AI
@@ -203,7 +206,10 @@ Generate a detailed financial analysis following this structure:
 Return as structured JSON with sections and insights. Be specific with numbers and percentages."""
 
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model='gemini-2.0-flash-exp',
+            contents=prompt
+        )
         response_text = response.text.strip()
         
         if "```json" in response_text:
@@ -314,13 +320,13 @@ def main():
         help="Upload CPT plans, Harvest data, and Financial income files"
     )
     
-    if uploaded_files and model:
+    if uploaded_files and client:
         
         if st.button("🚀 Generate Financial Report", type="primary"):
             
             with st.spinner("Processing files with AI..."):
                 # Process files
-                processed_data = process_files(uploaded_files, model)
+                processed_data = process_files(uploaded_files, client)
                 
                 st.success(f"✓ Processed {len(uploaded_files)} files successfully")
             
@@ -332,7 +338,7 @@ def main():
             
             # Generate analysis
             with st.spinner("Generating financial analysis..."):
-                analysis = generate_financial_analysis(processed_data, model)
+                analysis = generate_financial_analysis(processed_data, client)
             
             if analysis:
                 # Display Report
