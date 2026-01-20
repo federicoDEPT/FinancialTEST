@@ -1,51 +1,65 @@
 """
 financial_report_app.py
 
-Este módulo permite:
-- Leer múltiples archivos Excel con estructuras heterogéneas.
-- Detectar y normalizar columnas principales (fecha, horas, tarifa, ingreso, equipo) mediante heurísticas simples o la API de Gemini (opcional).
-- Calcular métricas financieras mensuales por equipo: valor quemado, ingresos, eficiencia y ganancia/pérdida.
-- Generar un informe PDF con tablas de resultados.
+This module provides utilities to build automated financial reports from one or
+more heterogeneous Excel files. It can normalise columns, compute monthly
+metrics per team, interact with the Gemini API for intelligent analysis and
+generate a PDF report.
 
-Requisitos: pandas, numpy, fpdf2, openpyxl (para leer Excel), requests (si se usa Gemini).
+Features
+--------
+* Read multiple Excel files regardless of varying structures.
+* Detect and normalise the key columns (date, team, hours, rate, revenue)
+  using simple heuristics or, optionally, the Gemini API.
+* Compute monthly financial metrics per team: total hours, burned value,
+  revenue, efficiency and profit/loss.
+* Generate a PDF report summarising the metrics with an optional
+  executive summary provided by Gemini.
+
+Dependencies: pandas, numpy, fpdf2, openpyxl (for reading Excel files),
+requests (only if using Gemini).
 """
 
-import pandas as pd
-import numpy as np
-from datetime import datetime
-from typing import List, Dict
+from __future__ import annotations
+
 import json
 from pathlib import Path
+from typing import Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+from datetime import datetime
 from fpdf import FPDF
 
+# Attempt to import requests; if unavailable, Gemini integration is disabled.
 try:
-    import requests  # opcional
-except ImportError:
-    requests = None  # si no está instalado, no se usa
+    import requests  # type: ignore
+except Exception:
+    requests = None
 
-# -----------------------------------------------------------------------------
-# Funciones de IA opcional (Gemini)
-# -----------------------------------------------------------------------------
+################################################################################
+# Optional AI functions (Gemini)
+################################################################################
 
 def annotate_columns_with_gemini(api_key: str, sample_row: List) -> str:
-    """Ejemplo de función para llamar a la API de Gemini.
-
-    Esta función envía un prompt que pide identificar el rol probable de cada
-    columna a partir de los valores de una fila de ejemplo. La respuesta debe
-    analizarse posteriormente para mapear las columnas. Si requests no está
-    disponible o el api_key es None, se devuelve una cadena vacía.
     """
-    if requests is None or api_key is None:
-        return ""
+    Call the Gemini API to infer column roles.
 
-    # Construir un prompt estructurado para obtener una lista de etiquetas en orden.
-    # Se solicita explícitamente una estructura JSON para facilitar el parseo de la respuesta.
+    This helper sends a structured prompt asking the model to identify the
+    likely role of each column based on values from a sample row. The model
+    should return a JSON object with a key ``labels`` containing a list of
+    standardised labels (``date``, ``team``, ``hours``, ``rate``, ``revenue``)
+    in the same order as the input cells. If the ``requests`` library is not
+    available or ``api_key`` is ``None``, an empty string is returned.
+    """
+    if requests is None or not api_key:
+        return ""
     prompt = (
-        "Estas son las celdas de la primera fila de un archivo Excel. "
-        "Devuelve un JSON con la clave 'labels' que contenga una lista de etiquetas estandarizadas "
-        "para cada columna en el mismo orden. Las etiquetas válidas son 'fecha', 'equipo', 'horas', 'tarifa', 'ingreso'.\n"
-        "Ejemplo de respuesta: {\"labels\": [\"fecha\", \"equipo\", \"horas\", \"tarifa\", \"ingreso\"]}.\n"
-        "Celdas: " + str(sample_row)
+        "These are the cells from the first row of an Excel file. "
+        "Return a JSON object with a key 'labels' containing a list of standardised column labels, "
+        "in the same order as the input cells. The valid labels are 'date', 'team', 'hours', 'rate', 'revenue'.\n"
+        "Example response: {\"labels\": [\"date\", \"team\", \"hours\", \"rate\", \"revenue\"]}.\n"
+        "Cells: " + str(sample_row)
     )
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
     headers = {"Content-Type": "application/json"}
@@ -56,44 +70,41 @@ def annotate_columns_with_gemini(api_key: str, sample_row: List) -> str:
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 256}
     }
     params = {"key": api_key}
-    resp = requests.post(url, json=payload, params=params, headers=headers)
-    resp.raise_for_status()
     try:
+        resp = requests.post(url, json=payload, params=params, headers=headers)  # type: ignore
+        resp.raise_for_status()
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
-        return resp.text
+        return ""
 
-# -----------------------------------------------------------------------------
-# Utilidades para interpretar la respuesta de Gemini y generar resúmenes
-# -----------------------------------------------------------------------------
-import re
 
 def parse_gemini_mapping(response: str, n_cols: int) -> List[str]:
     """
-    Intenta interpretar la respuesta de Gemini para obtener una lista de etiquetas. El
-    modelo debería devolver un JSON con la clave 'labels', pero si devuelve texto
-    libre o una lista simple, se usan expresiones regulares para extraer las
-    etiquetas válidas.
+    Interpret the response from Gemini and extract a list of column labels.
+
+    The model is expected to return a JSON object with the key ``labels``.
+    However, if it returns free-form text or a simple list, this helper will
+    attempt to parse out any valid labels using regular expressions. Both
+    English and Spanish synonyms are recognised and mapped to English.
 
     Parameters
     ----------
     response : str
-        Texto devuelto por la API de Gemini.
+        Raw text returned by the Gemini API.
     n_cols : int
-        Número de columnas en el DataFrame original.
+        Number of columns in the original DataFrame.
 
     Returns
     -------
     List[str]
-        Lista de etiquetas interpretadas. Si no se pueden extraer correctamente,
-        se devuelve una lista vacía.
+        A list of interpreted labels. If parsing fails, an empty list is
+        returned.
     """
     if not response:
         return []
     text = response.strip()
-    # Intentar parsear como JSON para facilitar la extracción
+    # Try to parse as JSON first
     try:
-        import json
         data = json.loads(text)
         if isinstance(data, dict) and 'labels' in data:
             labels_raw = data['labels']
@@ -101,60 +112,86 @@ def parse_gemini_mapping(response: str, n_cols: int) -> List[str]:
             labels_raw = data
         else:
             labels_raw = []
-        valid_labels = []
+        valid_labels: List[str] = []
         for item in labels_raw:
             if isinstance(item, str):
                 low = item.strip().lower()
-                if low in ['fecha', 'equipo', 'horas', 'tarifa', 'ingreso']:
-                    valid_labels.append(low)
+                # Accept both English and Spanish synonyms
+                synonyms = {
+                    'fecha': 'date',
+                    'date': 'date',
+                    'equipo': 'team',
+                    'team': 'team',
+                    'horas': 'hours',
+                    'hours': 'hours',
+                    'tarifa': 'rate',
+                    'rate': 'rate',
+                    'ingreso': 'revenue',
+                    'revenue': 'revenue'
+                }
+                if low in synonyms:
+                    valid_labels.append(synonyms[low])
         if valid_labels:
             return valid_labels
     except Exception:
         pass
-    # Si no se pudo parsear JSON, utilizar expresiones regulares como respaldo
-    keywords = ["fecha", "horas", "tarifa", "ingreso", "equipo"]
+    # Fall back to extracting keywords with regex
+    import re
+    keywords = ['date', 'team', 'hours', 'rate', 'revenue', 'fecha', 'equipo', 'horas', 'tarifa', 'ingreso']
     labels: List[str] = []
     for word in re.findall(r"\b\w+\b", text.lower()):
         if word in keywords and word not in labels:
-            labels.append(word)
+            if word in ['fecha', 'equipo', 'horas', 'tarifa', 'ingreso']:
+                word_map = {'fecha': 'date', 'equipo': 'team', 'horas': 'hours', 'tarifa': 'rate', 'ingreso': 'revenue'}
+                labels.append(word_map[word])
+            else:
+                labels.append(word)
         if len(labels) >= n_cols:
             break
     return labels
 
+
 def generate_summary_with_gemini(api_key: str, df_metrics: pd.DataFrame) -> str:
     """
-    Genera un resumen ejecutivo a partir del DataFrame de métricas mediante la API
-    de Gemini. El prompt describe la estructura del DataFrame y pide insights
-    clave, tendencias y recomendaciones. Si no se proporciona api_key, se
-    devolverá una cadena vacía.
+    Generate an executive summary from the metrics DataFrame using the Gemini API.
+
+    The prompt describes the structure of the DataFrame and asks for key
+    insights, trends and actionable recommendations. If no ``api_key`` is
+    provided or the request fails, an empty string is returned.
 
     Parameters
     ----------
     api_key : str
-        Clave de API para Gemini.
+        API key for Gemini.
     df_metrics : pd.DataFrame
-        DataFrame con columnas ['mes','equipo','horas','valor_quemado','ingreso','eficiencia','ganancia_perdida'].
+        DataFrame containing columns ['month','team','hours','burned_value',
+        'revenue','efficiency','profit_loss'].
 
     Returns
     -------
     str
-        Resumen generado por Gemini o cadena vacía si falla la llamada.
+        The summary generated by Gemini or an empty string if the call fails.
     """
-    if requests is None or api_key is None or df_metrics.empty:
+    if requests is None or not api_key or df_metrics.empty:
         return ""
-    # Convertir las métricas a una cadena de tabla simplificada
-    table_lines = ["mes\tequipo\thoras\tvalor_quemado\tingreso\teficiencia\tganancia_perdida"]
+    # Convert the metrics to a simplified tab-delimited string to include in the prompt
+    table_lines = ["month\tteam\thours\tburned_value\trevenue\tefficiency\tprofit_loss"]
     for _, row in df_metrics.iterrows():
-        line = f"{row['mes']}\t{row['equipo']}\t{row['horas']:.1f}\t{row['valor_quemado']:.2f}\t{row['ingreso']:.2f}\t{row['eficiencia']:.2f}\t{row['ganancia_perdida']:.2f}"
+        line = (
+            f"{row['month']}\t{row['team']}\t{row['hours']:.1f}\t"
+            f"{row['burned_value']:.2f}\t{row['revenue']:.2f}\t"
+            f"{row['efficiency']:.2f}\t{row['profit_loss']:.2f}"
+        )
         table_lines.append(line)
     table_text = "\n".join(table_lines)
     prompt = (
-        "Eres un analista financiero experto. A continuación se presentan métricas mensuales por equipo en formato de tabla con las columnas: "
-        "mes (periodo mensual), equipo, horas totales, valor quemado (horas×tarifa), ingreso total, eficiencia (ingreso/valor quemado) y ganancia o pérdida. "
-        "Debes analizar exhaustivamente estas métricas como si estuvieras en un chat de Gemini analizando los archivos originales: "
-        "calcula y comenta correlaciones entre las horas y el impacto financiero, detecta cambios en la mezcla de senioridad (por ejemplo, variaciones en la tarifa promedio), "
-        "identifica meses con sobreconsumo de horas o alta eficiencia, apunta cualquier riesgo de margen y sugiere acciones correctivas. "
-        "Redacta un resumen ejecutivo claro y recomendaciones concretas para cada equipo y periodo. No devuelvas la tabla ni repitas los números textualmente, enfócate en el análisis y las conclusiones.\n\n"
+        "You are a senior financial analyst. Below are monthly metrics by team in a tabular form with the columns: "
+        "month (monthly period), team, total hours, burned value (hours × rate), total revenue, efficiency (revenue/burned value) and profit or loss. "
+        "Analyse these metrics thoroughly as if you were conversing in a Gemini chat analysing the original files: "
+        "calculate and discuss correlations between hours and financial impact, detect changes in the seniority mix (for example, variations in the average rate), "
+        "identify months with overconsumption of hours or high efficiency, highlight any margin risks and suggest corrective actions. "
+        "Write a clear executive summary in English and provide concrete recommendations for each team and period. "
+        "Do not return the table or repeat the numbers verbatim; focus on the analysis and conclusions.\n\n"
         + table_text
     )
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
@@ -167,7 +204,7 @@ def generate_summary_with_gemini(api_key: str, df_metrics: pd.DataFrame) -> str:
     }
     params = {"key": api_key}
     try:
-        resp = requests.post(url, json=payload, params=params, headers=headers)
+        resp = requests.post(url, json=payload, params=params, headers=headers)  # type: ignore
         resp.raise_for_status()
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
@@ -176,48 +213,47 @@ def generate_summary_with_gemini(api_key: str, df_metrics: pd.DataFrame) -> str:
 
 def get_full_analysis_with_gemini(api_key: str, df: pd.DataFrame) -> Dict[str, object]:
     """
-    Envía el contenido completo del DataFrame a Gemini en formato CSV y pide
-    que identifique las columnas relevantes, calcule métricas mensuales por
-    equipo (horas, valor quemado, ingreso, eficiencia y ganancia/pérdida) y
-    devuelva tanto las métricas como un resumen ejecutivo. El modelo debe
-    responder con un JSON que contenga dos claves: "metrics" (lista de
-    objetos) y "summary" (cadena).
+    Send the full DataFrame content to Gemini in CSV format and ask it to identify the relevant columns,
+    compute monthly metrics per team (hours, burned value, revenue, efficiency and profit/loss) and return both
+    the metrics and an executive summary. The model should respond with a JSON object containing two keys:
+    ``metrics`` (list of objects) and ``summary`` (string).
 
-    Nota: Los modelos generativos tienen un límite de tokens. Para evitar
-    excederlo, se limita el número de filas enviadas. Si el DataFrame tiene
-    más de 200 filas, se envían solo las primeras 200.
+    Note: generative models have a token limit. To avoid exceeding it, the number of rows sent is capped. If
+    the DataFrame has more than 200 rows, only the first 200 rows are included in the prompt.
 
     Parameters
     ----------
     api_key : str
-        Clave de API de Gemini.
+        Gemini API key.
     df : pd.DataFrame
-        DataFrame con los datos originales del Excel (antes de normalizar).
+        The original DataFrame read from Excel (before normalisation).
 
     Returns
     -------
     dict
-        Diccionario con dos claves:
-        - 'metrics': DataFrame con las métricas calculadas por Gemini o vacío si falla la llamada.
-        - 'summary': cadena con el resumen ejecutivo.
+        Dictionary with two keys:
+        - ``metrics``: DataFrame with the metrics calculated by Gemini or empty if the call fails.
+        - ``summary``: string containing the executive summary.
     """
     result = {'metrics': pd.DataFrame(), 'summary': ''}
-    if requests is None or api_key is None or df.empty:
+    if requests is None or not api_key or df.empty:
         return result
-    # Limitar el número de filas para evitar prompts demasiado grandes
+    # Limit the number of rows to avoid overly long prompts
     max_rows = 200
     if len(df) > max_rows:
         df_to_send = df.head(max_rows).copy()
     else:
         df_to_send = df.copy()
-    # Convertir a CSV sin índice
+    # Convert to CSV without index
     csv_data = df_to_send.to_csv(index=False)
-    # Construir prompt solicitando JSON con métricas y resumen
+    # Build prompt requesting JSON with metrics and summary
     prompt = (
-        "Eres un analista financiero. A continuación se presenta el contenido de un archivo Excel en formato CSV. "
-        "Debes identificar las columnas correspondientes a fecha, equipo, horas, tarifa e ingreso, "
-        "agrupando los datos por mes y equipo para calcular las siguientes métricas: horas totales, valor quemado (horas×tarifa), ingreso total, eficiencia (ingreso/valor quemado) y ganancia o pérdida (ingreso - valor quemado). "
-        "Devuelve la respuesta en formato JSON con dos claves: 'metrics' y 'summary'. 'metrics' debe ser una lista de objetos con las claves 'mes', 'equipo', 'horas', 'valor_quemado', 'ingreso', 'eficiencia' y 'ganancia_perdida'. 'summary' debe ser un texto que resuma los hallazgos y recomendaciones.\n\n"
+        "You are a financial analyst. The following is the content of an Excel file in CSV format. "
+        "Identify the columns corresponding to date, team, hours, rate and revenue. "
+        "Group the data by month and team and compute the following metrics: total hours, burned value (hours × rate), total revenue, efficiency (revenue divided by burned value) and profit or loss (revenue minus burned value). "
+        "Return the response as a JSON object with two keys: 'metrics' and 'summary'. "
+        "'metrics' should be a list of objects with the keys 'month', 'team', 'hours', 'burned_value', 'revenue', 'efficiency' and 'profit_loss'. "
+        "'summary' should be a text that summarises the findings and recommendations in English.\n\n"
         + "CSV:\n" + csv_data
     )
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
@@ -230,20 +266,23 @@ def get_full_analysis_with_gemini(api_key: str, df: pd.DataFrame) -> Dict[str, o
     }
     params = {"key": api_key}
     try:
-        resp = requests.post(url, json=payload, params=params, headers=headers)
+        resp = requests.post(url, json=payload, params=params, headers=headers)  # type: ignore
         resp.raise_for_status()
         text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        # Intentar parsear como JSON
+        # Attempt to parse the response as JSON
         data = json.loads(text)
-        # Convertir metrics a DataFrame si corresponde
         metrics_list = data.get('metrics') if isinstance(data, dict) else None
         if isinstance(metrics_list, list):
             df_metrics = pd.DataFrame(metrics_list)
-            # Asegurar que columnas numéricas se conviertan correctamente
-            for col in ['horas', 'valor_quemado', 'ingreso', 'eficiencia', 'ganancia_perdida']:
+            # Convert numeric columns appropriately, supporting both English and Spanish names
+            numeric_cols = ['hours', 'burned_value', 'revenue', 'efficiency', 'profit_loss',
+                            'horas', 'valor_quemado', 'ingreso', 'eficiencia', 'ganancia_perdida']
+            for col in numeric_cols:
                 if col in df_metrics.columns:
                     df_metrics[col] = pd.to_numeric(df_metrics[col], errors='coerce')
-            # Convertir 'mes' a period (si es string)
+            # Ensure 'month' or Spanish 'mes' columns are strings
+            if 'month' in df_metrics.columns:
+                df_metrics['month'] = df_metrics['month'].astype(str)
             if 'mes' in df_metrics.columns:
                 df_metrics['mes'] = df_metrics['mes'].astype(str)
         else:
@@ -252,42 +291,46 @@ def get_full_analysis_with_gemini(api_key: str, df: pd.DataFrame) -> Dict[str, o
         summary_text = data.get('summary', '') if isinstance(data, dict) else ''
         result['summary'] = summary_text
     except Exception:
-        # Si no se puede parsear o falla la llamada, devolver resultado vacío
+        # Return empty result on failure
         result['metrics'] = pd.DataFrame()
         result['summary'] = ''
     return result
 
 
-# -----------------------------------------------------------------------------
-# Detección de encabezados y normalización
-# -----------------------------------------------------------------------------
+################################################################################
+# Header detection and normalisation
+################################################################################
 
-def detect_headers(df: pd.DataFrame, api_key: str = None) -> Dict[int, str]:
+def detect_headers(df: pd.DataFrame, api_key: Optional[str] = None) -> Dict[int, str]:
     """
-    Intenta asignar nombres estándar a las columnas de un DataFrame sin encabezados.
-    Devuelve un diccionario que mapea índices de columna a nombres estándar.
+    Attempt to assign standard names to the columns of a DataFrame without headers.
 
-    Heurísticas empleadas:
-    - Si la columna contiene fechas, se asigna 'fecha'.
-    - Si la columna contiene números y su media < 50, se asigna 'horas'.
-    - Si la media está entre 50 y 500, se asigna 'tarifa'.
-    - Si la media es mayor, se asigna 'ingreso'.
-    - De lo contrario, se asigna 'equipo'.
+    If an API key is provided, the model is consulted first to obtain label
+    suggestions based on the first row of data. Suggestions are applied in order;
+    for any remaining columns heuristics are used. The heuristics are:
 
-    Si se proporciona api_key y se desea usar Gemini, se obtiene una sugerencia
-    adicional (no implementada el parseo en este ejemplo).
-    """
-    """
-    Intenta asignar nombres estándar a las columnas de un DataFrame. Si se
-    proporciona una API key de Gemini, se consulta primero al modelo para
-    obtener sugerencias de etiquetas basadas en la primera fila de datos. Las
-    sugerencias se aplican en el orden en que aparecen. Si alguna columna
-    permanece sin clasificar, se utilizan heurísticas simples para completar
-    el mapeo.
+    * If the column contains dates (based on successful parsing), label it as ``date``.
+    * If the column contains numbers and its mean is less than 50, label it as ``hours``.
+    * If the mean is between 50 and 500, label it as ``rate``.
+    * If the mean is greater or equal to 500, label it as ``revenue``.
+    * Otherwise, label it as ``team``.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame to analyse.
+    api_key : str, optional
+        Gemini API key used to obtain suggestions. If ``None``, only heuristics
+        are used.
+
+    Returns
+    -------
+    Dict[int, str]
+        Mapping from column index to a standard name.
     """
     n_cols = len(df.columns)
     mapping: Dict[int, str] = {}
-    # Si tenemos API key, consultar primero a Gemini
+    # If we have an API key, consult Gemini first
     suggestions: List[str] = []
     if api_key:
         row_sample = df.iloc[0].tolist()
@@ -296,188 +339,217 @@ def detect_headers(df: pd.DataFrame, api_key: str = None) -> Dict[int, str]:
             suggestions = parse_gemini_mapping(response, n_cols)
         except Exception:
             suggestions = []
-    # Aplicar sugerencias en orden
+    # Apply suggestions in order
     for idx, label in enumerate(suggestions):
         mapping[idx] = label
-    # Para columnas no mapeadas, usar heurísticas
+    # Use heuristics for unmapped columns
     for idx, col in enumerate(df.columns):
         if idx in mapping:
             continue
         series = df[col].dropna().head(20)
-        # Intentar convertir a datetime
+        # Try to interpret as date
         try:
             parsed = pd.to_datetime(series, errors='coerce')
             if parsed.notna().sum() >= max(1, int(0.3 * len(series))):
-                mapping[idx] = 'fecha'
+                mapping[idx] = 'date'
                 continue
         except Exception:
             pass
-        # Si es numérica
+        # If numeric
         if pd.api.types.is_numeric_dtype(series):
             mean_val = series.astype(float).mean()
             if mean_val < 50:
-                mapping[idx] = 'horas'
+                mapping[idx] = 'hours'
             elif mean_val < 500:
-                mapping[idx] = 'tarifa'
+                mapping[idx] = 'rate'
             else:
-                mapping[idx] = 'ingreso'
+                mapping[idx] = 'revenue'
         else:
-            mapping[idx] = 'equipo'
+            mapping[idx] = 'team'
     return mapping
 
 
 def normalize_dataframe(df: pd.DataFrame, header_map: Dict[int, str]) -> pd.DataFrame:
     """
-    Renombra las columnas según ``header_map`` y devuelve solo las columnas estándar.
+    Rename columns according to ``header_map`` and return only the standard columns.
 
-    Si dos o más columnas se mapean al mismo nombre estándar (por ejemplo, si
-    varias columnas se clasifican como "equipo"), pandas permite columnas
-    duplicadas, lo que más tarde provoca un ``InvalidIndexError`` al concatenar
-    dataframes. Para evitarlo, después del renombrado se eliminan las
-    columnas duplicadas conservando la primera aparición.
+    If two or more columns map to the same standard name (for example, if
+    multiple columns are classified as ``team``), pandas will allow duplicate
+    columns. Concatenating such DataFrames can later raise an ``InvalidIndexError``.
+    To avoid this, duplicate columns are removed after renaming, keeping the first
+    occurrence.
 
     Parameters
     ----------
     df : pd.DataFrame
-        DataFrame sin encabezado leído directamente del Excel.
+        A DataFrame without headers read directly from Excel.
     header_map : Dict[int, str]
-        Mapeo de índice de columna a nombre estándar.
+        Mapping from column index to standard column name.
 
     Returns
     -------
     pd.DataFrame
-        DataFrame con columnas únicas ['fecha','equipo','horas','tarifa','ingreso'].
+        DataFrame with unique columns ['date','team','hours','rate','revenue'] in order.
     """
-    # Renombrar columnas según el mapeo de índices
+    # Rename columns according to the index mapping
     rename_dict = {df.columns[idx]: std_name for idx, std_name in header_map.items()}
     df = df.rename(columns=rename_dict)
-    # Eliminar columnas duplicadas (conservar la primera)
+    # Remove duplicate columns (keep the first)
     df = df.loc[:, ~df.columns.duplicated()]
-    # Seleccionar columnas deseadas en orden
-    desired_cols = ['fecha', 'equipo', 'horas', 'tarifa', 'ingreso']
-    # Añadir columnas faltantes con NaN
+    # Desired columns in standard order
+    desired_cols = ['date', 'team', 'hours', 'rate', 'revenue']
+    # Add missing columns as NaN
     for col in desired_cols:
         if col not in df.columns:
             df[col] = np.nan
-    # Devuelve solo las columnas deseadas, en el orden especificado
     return df[desired_cols]
 
 
-def read_excel_files(paths: List[str], api_key: str = None) -> pd.DataFrame:
+def read_excel_files(paths: List[str], api_key: Optional[str] = None) -> pd.DataFrame:
     """
-    Lee múltiples archivos Excel y concatena sus datos normalizados.
+    Read and normalise the contents of multiple Excel files.
 
-    Parameters:
-        paths: lista de rutas a archivos Excel.
-        api_key: opcional, clave de API para usar Gemini.
+    For each file in ``paths`` all worksheets are loaded without assuming any
+    header row. Columns are then assigned standard names (``date``, ``team``,
+    ``hours``, ``rate``, ``revenue``) via ``detect_headers`` which optionally
+    consults Gemini. The raw sheets are normalised to these columns and any
+    duplicate column names are dropped. Finally all sheets are concatenated
+    together. To avoid the ``InvalidIndexError`` raised by pandas when
+    concatenating frames with duplicate column names, the function builds the
+    union of columns across all frames and fills missing values with
+    ``NaN`` before concatenation.
 
-    Returns:
-        DataFrame con columnas estandarizadas.
+    Parameters
+    ----------
+    paths : List[str]
+        Paths to Excel files to read.
+    api_key : str, optional
+        Gemini API key used to improve header detection. If ``None``, only
+        heuristics are used.
+
+    Returns
+    -------
+    pd.DataFrame
+        A single DataFrame containing all normalised data from the input files.
     """
-    frames = []
+    frames: List[pd.DataFrame] = []
     for path in paths:
         xls = pd.ExcelFile(path)
         for sheet_name in xls.sheet_names:
-            # Leer la hoja sin encabezados
+            # Read each sheet without a header row
             df_raw = pd.read_excel(xls, sheet_name=sheet_name, header=None)
-
-            # No hacemos detección de sinónimos; siempre utilizamos Gemini (o heurísticas de backup) para detectar encabezados
+            # Detect headers using Gemini (if api_key provided) or heuristics
             header_map = detect_headers(df_raw, api_key)
             df_norm = normalize_dataframe(df_raw, header_map)
             frames.append(df_norm)
     if frames:
-        try:
-            # Intentar concatenar directamente
-            return pd.concat(frames, ignore_index=True)
-        except Exception as e:
-            # Puede fallar si existen índices o columnas duplicadas. Aplicar
-            # limpieza de duplicados y usar métodos de deduplicación.
-            try:
-                frames_clean = []
-                for df in frames:
-                    # Asegurar que las columnas sean únicas dentro de cada DataFrame
-                    df = df.loc[:, ~df.columns.duplicated()]
-                    frames_clean.append(df)
-                return pd.concat(frames_clean, ignore_index=True)
-            except Exception:
-                # Último recurso: unir con todas las columnas y deduplicar nombres
-                concat_df = pd.concat(frames, ignore_index=True, join='outer', sort=False)
-                # Deduplicar nombres de columnas añadiendo sufijos
-                try:
-                    from pandas.io.parsers import ParserBase
-                    parser = ParserBase({'names': list(concat_df.columns)})
-                    concat_df.columns = parser._maybe_dedup_names(concat_df.columns)
-                except Exception:
-                    # Si falla la deduplicación, dejar las columnas tal cual
-                    pass
-                return concat_df
-    return pd.DataFrame(columns=['fecha', 'equipo', 'horas', 'tarifa', 'ingreso'])
+        # Ensure each DataFrame has unique column names by removing duplicates
+        frames_unique: List[pd.DataFrame] = []
+        for df in frames:
+            df_clean = df.loc[:, ~df.columns.duplicated()].copy()
+            frames_unique.append(df_clean)
+        # Collect the union of all column names across frames
+        all_columns: List[str] = []
+        for df in frames_unique:
+            for col in df.columns:
+                if col not in all_columns:
+                    all_columns.append(col)
+        # Pad each DataFrame to contain all columns, filling missing values with NA
+        standardized_frames: List[pd.DataFrame] = []
+        for df in frames_unique:
+            for col in all_columns:
+                if col not in df.columns:
+                    df[col] = pd.NA
+            standardized_frames.append(df[all_columns])
+        # Concatenate all standardised DataFrames
+        return pd.concat(standardized_frames, ignore_index=True)
+    # If no frames were produced, return an empty DataFrame with the standard columns
+    return pd.DataFrame(columns=['date', 'team', 'hours', 'rate', 'revenue'])
 
 
-# -----------------------------------------------------------------------------
-# Cálculo de métricas financieras
-# -----------------------------------------------------------------------------
+################################################################################
+# Financial metrics computation
+################################################################################
 
 def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calcula métricas financieras mensuales por equipo.
+    Compute monthly financial metrics per team.
 
-    - Convierte 'fecha' a tipo datetime y extrae el período mensual.
-    - Calcula el valor quemado = horas × tarifa.
-    - Agrupa por mes y equipo: suma horas, valor quemado e ingresos.
-    - Calcula eficiencia e ingreso menos valor quemado.
+    The function performs the following steps:
+
+    * Convert the ``date`` column to datetime and extract the monthly period.
+    * Compute the burned value as ``hours × rate``.
+    * Group by month and team: sum hours, burned value and revenue.
+    * Calculate efficiency (revenue/burned value) and profit/loss (revenue - burned value).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing columns ['date','team','hours','rate','revenue'].
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns ['month','team','hours','burned_value','revenue','efficiency','profit_loss'].
     """
     df = df.copy()
-    # Convertir fechas
-    df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce')
-    df['mes'] = df['fecha'].dt.to_period('M')
-    # Calcular valor quemado
-    df['horas'] = pd.to_numeric(df['horas'], errors='coerce')
-    df['tarifa'] = pd.to_numeric(df['tarifa'], errors='coerce')
-    df['ingreso'] = pd.to_numeric(df['ingreso'], errors='coerce')
-    df['valor_quemado'] = df['horas'] * df['tarifa']
-    # Agrupar
-    agg = df.groupby(['mes', 'equipo']).agg({
-        'horas': 'sum',
-        'valor_quemado': 'sum',
-        'ingreso': 'sum'
+    # Convert dates
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df['month'] = df['date'].dt.to_period('M')
+    # Compute burned value
+    df['hours'] = pd.to_numeric(df['hours'], errors='coerce')
+    df['rate'] = pd.to_numeric(df['rate'], errors='coerce')
+    df['revenue'] = pd.to_numeric(df['revenue'], errors='coerce')
+    df['burned_value'] = df['hours'] * df['rate']
+    # Group by month and team
+    agg = df.groupby(['month', 'team']).agg({
+        'hours': 'sum',
+        'burned_value': 'sum',
+        'revenue': 'sum'
     }).reset_index()
-    # Calcular eficiencia y ganancia/pérdida
-    agg['eficiencia'] = np.where(agg['valor_quemado'] != 0,
-                                 agg['ingreso'] / agg['valor_quemado'], np.nan)
-    agg['ganancia_perdida'] = agg['ingreso'] - agg['valor_quemado']
+    # Calculate efficiency and profit/loss
+    agg['efficiency'] = np.where(agg['burned_value'] != 0,
+                                 agg['revenue'] / agg['burned_value'], np.nan)
+    agg['profit_loss'] = agg['revenue'] - agg['burned_value']
     return agg
 
 
-# -----------------------------------------------------------------------------
-# Generación de PDF
-# -----------------------------------------------------------------------------
+################################################################################
+# PDF generation utilities
+################################################################################
+
 class FinancialPDF(FPDF):
     """
-    Clase que extiende FPDF para añadir pies de página con numeración.
+    Custom FPDF subclass that includes page numbering in the footer.
     """
-    def footer(self):
+    def footer(self) -> None:
+        # Position at 15 mm from bottom
         self.set_y(-15)
-        self.set_font('Arial', 'I', 8)
-        self.cell(0, 10, f'Página {self.page_no()}', 0, 0, 'C')
+        # Use an italic font for footer; DejaVu if available
+        try:
+            self.set_font('DejaVu', 'I', 8)
+        except Exception:
+            self.set_font('Arial', 'I', 8)
+        # Footer text
+        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
 
 
-# Helper function to sanitize text for PDF
 def _sanitize_text(text: str) -> str:
     """
     Replace characters that are not supported by the default FPDF core fonts
     (latin-1 encoding). Converts curly quotes, long dashes and bullets to
-    simpler equivalents.
+    simpler equivalents. This ensures that even if the fallback font is used
+    instead of a Unicode font, the text will not raise encoding errors.
 
     Parameters
     ----------
     text : str
-        Input string to sanitize.
+        Input string to sanitise.
 
     Returns
     -------
     str
-        Sanitized string safe for FPDF.
+        Sanitised string safe for FPDF.
     """
     if not text:
         return ""
@@ -499,101 +571,97 @@ def _sanitize_text(text: str) -> str:
 def generate_financial_report(
     df_metrics: pd.DataFrame,
     output_path: str,
-    company_name: str = "Informe",
-    summary: str | None = None,
+    company_name: str = "Report",
+    summary: Optional[str] = None,
 ) -> None:
     """
-    Genera un informe PDF con las métricas y un resumen opcional.
+    Generate a PDF report with the metrics and an optional executive summary.
 
     Parameters
     ----------
     df_metrics : pd.DataFrame
-        DataFrame con columnas ['mes','equipo','horas','valor_quemado','ingreso','eficiencia','ganancia_perdida'].
+        DataFrame containing columns ['month','team','hours','burned_value','revenue','efficiency','profit_loss'].
     output_path : str
-        Ruta donde se guardará el PDF.
-    company_name : str, opcional
-        Nombre de la organización o proyecto.
-    summary : str, opcional
-        Resumen ejecutivo que se incluirá al inicio del informe. Si se omite o
-        ``None``, se mostrará solo una breve introducción.
+        Path where the PDF will be saved.
+    company_name : str, optional
+        Name of the organisation or project to display in the report title.
+    summary : str, optional
+        Executive summary to include at the beginning of the report. If omitted
+        or ``None``, only a brief introduction is shown.
     """
     pdf = FinancialPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    # Título
-    pdf.set_font('Arial', 'B', 16)
-    pdf.cell(0, 10, f'INFORME FINANCIERO - {company_name}', ln=True)
+    # Register Unicode-capable fonts (DejaVu). FPDF caches added fonts so repeated
+    # calls are safe.
+    try:
+        pdf.add_font('DejaVu', '', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', uni=True)
+        pdf.add_font('DejaVu', 'B', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', uni=True)
+        pdf.add_font('DejaVu', 'I', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf', uni=True)
+    except Exception:
+        pass
+
+    # Title
+    try:
+        pdf.set_font('DejaVu', 'B', 16)
+    except Exception:
+        pdf.set_font('Arial', 'B', 16)
+    pdf.cell(0, 10, f'FINANCIAL REPORT - {company_name}', ln=True)
     pdf.ln(4)
-    # Introducción y resumen
-    pdf.set_font('Arial', '', 11)
+    # Introduction and summary
+    try:
+        pdf.set_font('DejaVu', '', 11)
+    except Exception:
+        pdf.set_font('Arial', '', 11)
     intro = (
-        "Este informe presenta la evolución de las horas trabajadas, el valor de trabajo "
-        "quemado, los ingresos y la eficiencia de cada equipo por mes. Los valores se "
-        "calculan automáticamente a partir de los archivos Excel cargados."
+        "This report presents the evolution of total hours worked, burned value, revenue and efficiency "
+        "for each team by month. The values are calculated automatically from the uploaded Excel files."
     )
     pdf.multi_cell(0, 6, _sanitize_text(intro))
     pdf.ln(4)
     if summary:
-        # Añadir encabezado para el resumen
-        pdf.set_font('Arial', 'B', 12)
-        pdf.cell(0, 7, "Resumen ejecutivo", ln=True)
-        pdf.set_font('Arial', '', 10)
+        # Add header for the summary
+        try:
+            pdf.set_font('DejaVu', 'B', 12)
+        except Exception:
+            pdf.set_font('Arial', 'B', 12)
+        pdf.cell(0, 7, "Executive summary", ln=True)
+        try:
+            pdf.set_font('DejaVu', '', 10)
+        except Exception:
+            pdf.set_font('Arial', '', 10)
         pdf.multi_cell(0, 5, _sanitize_text(summary.strip()))
         pdf.ln(4)
 
-    # Encabezados de tabla
-    pdf.set_font('Arial', 'B', 10)
-    headers = ['Mes', 'Equipo', 'Horas', 'Valor quemado', 'Ingreso', 'Eficiencia', 'Ganancia/Pérdida']
+    # Table headers
+    try:
+        pdf.set_font('DejaVu', 'B', 10)
+    except Exception:
+        pdf.set_font('Arial', 'B', 10)
+    headers = ['Month', 'Team', 'Hours', 'Burned value', 'Revenue', 'Efficiency', 'Profit/Loss']
     col_widths = [25, 35, 25, 35, 30, 25, 40]
     for header, width in zip(headers, col_widths):
         pdf.cell(width, 8, header, 1, 0, 'C')
     pdf.ln()
 
-    # Filas de la tabla
-    pdf.set_font('Arial', '', 9)
+    # Table rows
+    try:
+        pdf.set_font('DejaVu', '', 9)
+    except Exception:
+        pdf.set_font('Arial', '', 9)
     for _, row in df_metrics.iterrows():
-        pdf.cell(col_widths[0], 7, _sanitize_text(str(row['mes'])), 1)
-        pdf.cell(col_widths[1], 7, _sanitize_text(str(row['equipo'])), 1)
-        pdf.cell(col_widths[2], 7, f"{row['horas']:.1f}", 1, 0, 'R')
-        pdf.cell(col_widths[3], 7, f"${row['valor_quemado']:.2f}", 1, 0, 'R')
-        pdf.cell(col_widths[4], 7, f"${row['ingreso']:.2f}", 1, 0, 'R')
-        # Eficiencia en %
-        eff = row['eficiencia'] * 100 if pd.notna(row['eficiencia']) else 0
+        pdf.cell(col_widths[0], 7, _sanitize_text(str(row['month'])), 1)
+        pdf.cell(col_widths[1], 7, _sanitize_text(str(row['team'])), 1)
+        pdf.cell(col_widths[2], 7, f"{row['hours']:.1f}", 1, 0, 'R')
+        pdf.cell(col_widths[3], 7, f"${row['burned_value']:.2f}", 1, 0, 'R')
+        pdf.cell(col_widths[4], 7, f"${row['revenue']:.2f}", 1, 0, 'R')
+        eff = row['efficiency'] * 100 if pd.notna(row['efficiency']) else 0
         pdf.cell(col_widths[5], 7, f"{eff:.1f}%", 1, 0, 'R')
-        pdf.cell(col_widths[6], 7, f"${row['ganancia_perdida']:.2f}", 1, 0, 'R')
+        pdf.cell(col_widths[6], 7, f"${row['profit_loss']:.2f}", 1, 0, 'R')
         pdf.ln()
 
-    # Guardar PDF
+    # Save PDF
     output_dir = Path(output_path).parent
     output_dir.mkdir(parents=True, exist_ok=True)
     pdf.output(output_path)
-
-
-# -----------------------------------------------------------------------------
-# Ejecutable de ejemplo
-# -----------------------------------------------------------------------------
-if __name__ == '__main__':
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Generador de informes financieros a partir de archivos Excel.')
-    parser.add_argument('files', nargs='+', help='Rutas de archivos Excel a procesar')
-    parser.add_argument('-o', '--output', default='informe_financiero.pdf', help='Ruta de salida del PDF')
-    parser.add_argument('--api-key', help='Clave de API de Gemini (opcional)')
-    parser.add_argument('--company', default='Proyecto', help='Nombre de la empresa o proyecto')
-    args = parser.parse_args()
-
-    # Leer y normalizar
-    df_all = read_excel_files(args.files, api_key=args.api_key)
-    # Calcular métricas
-    df_metrics = compute_metrics(df_all)
-    # Generar resumen con Gemini si se proporciona API key
-    summary = None
-    if args.api_key:
-        try:
-            summary = generate_summary_with_gemini(args.api_key, df_metrics)
-        except Exception:
-            summary = None
-    # Generar PDF con resumen opcional
-    generate_financial_report(df_metrics, args.output, company_name=args.company, summary=summary)
-    print(f'Informe generado en {args.output}')
