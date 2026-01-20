@@ -125,11 +125,12 @@ def generate_summary_with_gemini(api_key: str, df_metrics: pd.DataFrame) -> str:
         table_lines.append(line)
     table_text = "\n".join(table_lines)
     prompt = (
-        "A continuación se presentan métricas financieras mensuales por equipo en formato de tabla con las columnas: "
+        "Eres un analista financiero experto. A continuación se presentan métricas mensuales por equipo en formato de tabla con las columnas: "
         "mes (periodo mensual), equipo, horas totales, valor quemado (horas×tarifa), ingreso total, eficiencia (ingreso/valor quemado) y ganancia o pérdida. "
-        "Analiza la tabla, identifica tendencias destacadas, patrones de eficiencia y riesgos financieros. "
-        "Resume la situación de cada equipo, destacando meses con sobreconsumo (alta quema) o alta eficiencia, e incluye recomendaciones para mejorar los resultados. "
-        "No devuelvas la tabla, sólo el análisis y recomendaciones.\n\n"
+        "Debes analizar exhaustivamente estas métricas como si estuvieras en un chat de Gemini analizando los archivos originales: "
+        "calcula y comenta correlaciones entre las horas y el impacto financiero, detecta cambios en la mezcla de senioridad (por ejemplo, variaciones en la tarifa promedio), "
+        "identifica meses con sobreconsumo de horas o alta eficiencia, apunta cualquier riesgo de margen y sugiere acciones correctivas. "
+        "Redacta un resumen ejecutivo claro y recomendaciones concretas para cada equipo y periodo. No devuelvas la tabla ni repitas los números textualmente, enfócate en el análisis y las conclusiones.\n\n"
         + table_text
     )
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
@@ -168,12 +169,35 @@ def detect_headers(df: pd.DataFrame, api_key: str = None) -> Dict[int, str]:
     Si se proporciona api_key y se desea usar Gemini, se obtiene una sugerencia
     adicional (no implementada el parseo en este ejemplo).
     """
+    """
+    Intenta asignar nombres estándar a las columnas de un DataFrame. Si se
+    proporciona una API key de Gemini, se consulta primero al modelo para
+    obtener sugerencias de etiquetas basadas en la primera fila de datos. Las
+    sugerencias se aplican en el orden en que aparecen. Si alguna columna
+    permanece sin clasificar, se utilizan heurísticas simples para completar
+    el mapeo.
+    """
+    n_cols = len(df.columns)
     mapping: Dict[int, str] = {}
+    # Si tenemos API key, consultar primero a Gemini
+    suggestions: List[str] = []
+    if api_key:
+        row_sample = df.iloc[0].tolist()
+        try:
+            response = annotate_columns_with_gemini(api_key, row_sample)
+            suggestions = parse_gemini_mapping(response, n_cols)
+        except Exception:
+            suggestions = []
+    # Aplicar sugerencias en orden
+    for idx, label in enumerate(suggestions):
+        mapping[idx] = label
+    # Para columnas no mapeadas, usar heurísticas
     for idx, col in enumerate(df.columns):
+        if idx in mapping:
+            continue
         series = df[col].dropna().head(20)
         # Intentar convertir a datetime
         try:
-            # Si al menos el 30% de las primeras 10 celdas se convierten a fechas
             parsed = pd.to_datetime(series, errors='coerce')
             if parsed.notna().sum() >= max(1, int(0.3 * len(series))):
                 mapping[idx] = 'fecha'
@@ -191,20 +215,6 @@ def detect_headers(df: pd.DataFrame, api_key: str = None) -> Dict[int, str]:
                 mapping[idx] = 'ingreso'
         else:
             mapping[idx] = 'equipo'
-
-    # Llamada opcional a Gemini para sugerir etiquetas
-    if api_key:
-        row_sample = df.iloc[0].tolist()
-        try:
-            response = annotate_columns_with_gemini(api_key, row_sample)
-            suggestions = parse_gemini_mapping(response, len(df.columns))
-            # Actualizar mapping según las sugerencias: asignar cada sugerencia al índice correspondiente
-            for idx_s, label in enumerate(suggestions):
-                # Si ya existe un mapeo, no lo sobrescribimos
-                if idx_s not in mapping:
-                    mapping[idx_s] = label
-        except Exception:
-            pass
     return mapping
 
 
@@ -260,12 +270,39 @@ def read_excel_files(paths: List[str], api_key: str = None) -> pd.DataFrame:
     for path in paths:
         xls = pd.ExcelFile(path)
         for sheet_name in xls.sheet_names:
+            # Leer la hoja sin encabezados
             df_raw = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+
+            # No hacemos detección de sinónimos; siempre utilizamos Gemini (o heurísticas de backup) para detectar encabezados
             header_map = detect_headers(df_raw, api_key)
             df_norm = normalize_dataframe(df_raw, header_map)
             frames.append(df_norm)
     if frames:
-        return pd.concat(frames, ignore_index=True)
+        try:
+            # Intentar concatenar directamente
+            return pd.concat(frames, ignore_index=True)
+        except Exception as e:
+            # Puede fallar si existen índices o columnas duplicadas. Aplicar
+            # limpieza de duplicados y usar métodos de deduplicación.
+            try:
+                frames_clean = []
+                for df in frames:
+                    # Asegurar que las columnas sean únicas dentro de cada DataFrame
+                    df = df.loc[:, ~df.columns.duplicated()]
+                    frames_clean.append(df)
+                return pd.concat(frames_clean, ignore_index=True)
+            except Exception:
+                # Último recurso: unir con todas las columnas y deduplicar nombres
+                concat_df = pd.concat(frames, ignore_index=True, join='outer', sort=False)
+                # Deduplicar nombres de columnas añadiendo sufijos
+                try:
+                    from pandas.io.parsers import ParserBase
+                    parser = ParserBase({'names': list(concat_df.columns)})
+                    concat_df.columns = parser._maybe_dedup_names(concat_df.columns)
+                except Exception:
+                    # Si falla la deduplicación, dejar las columnas tal cual
+                    pass
+                return concat_df
     return pd.DataFrame(columns=['fecha', 'equipo', 'horas', 'tarifa', 'ingreso'])
 
 
@@ -317,6 +354,40 @@ class FinancialPDF(FPDF):
         self.cell(0, 10, f'Página {self.page_no()}', 0, 0, 'C')
 
 
+# Helper function to sanitize text for PDF
+def _sanitize_text(text: str) -> str:
+    """
+    Replace characters that are not supported by the default FPDF core fonts
+    (latin-1 encoding). Converts curly quotes, long dashes and bullets to
+    simpler equivalents.
+
+    Parameters
+    ----------
+    text : str
+        Input string to sanitize.
+
+    Returns
+    -------
+    str
+        Sanitized string safe for FPDF.
+    """
+    if not text:
+        return ""
+    replacements = {
+        '’': "'",
+        '‘': "'",
+        '“': '"',
+        '”': '"',
+        '–': '-',  # en dash
+        '—': '-',  # em dash
+        '•': '*',  # bullet
+        '·': '-',
+    }
+    for orig, repl in replacements.items():
+        text = text.replace(orig, repl)
+    return text
+
+
 def generate_financial_report(
     df_metrics: pd.DataFrame,
     output_path: str,
@@ -353,14 +424,14 @@ def generate_financial_report(
         "quemado, los ingresos y la eficiencia de cada equipo por mes. Los valores se "
         "calculan automáticamente a partir de los archivos Excel cargados."
     )
-    pdf.multi_cell(0, 6, intro)
+    pdf.multi_cell(0, 6, _sanitize_text(intro))
     pdf.ln(4)
     if summary:
         # Añadir encabezado para el resumen
         pdf.set_font('Arial', 'B', 12)
         pdf.cell(0, 7, "Resumen ejecutivo", ln=True)
         pdf.set_font('Arial', '', 10)
-        pdf.multi_cell(0, 5, summary.strip())
+        pdf.multi_cell(0, 5, _sanitize_text(summary.strip()))
         pdf.ln(4)
 
     # Encabezados de tabla
@@ -374,8 +445,8 @@ def generate_financial_report(
     # Filas de la tabla
     pdf.set_font('Arial', '', 9)
     for _, row in df_metrics.iterrows():
-        pdf.cell(col_widths[0], 7, str(row['mes']), 1)
-        pdf.cell(col_widths[1], 7, str(row['equipo']), 1)
+        pdf.cell(col_widths[0], 7, _sanitize_text(str(row['mes'])), 1)
+        pdf.cell(col_widths[1], 7, _sanitize_text(str(row['equipo'])), 1)
         pdf.cell(col_widths[2], 7, f"{row['horas']:.1f}", 1, 0, 'R')
         pdf.cell(col_widths[3], 7, f"${row['valor_quemado']:.2f}", 1, 0, 'R')
         pdf.cell(col_widths[4], 7, f"${row['ingreso']:.2f}", 1, 0, 'R')
