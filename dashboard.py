@@ -32,6 +32,7 @@ from financial_report_app import (
     compute_metrics,
     generate_summary_with_gemini,
     generate_financial_report,
+    get_full_analysis_with_gemini,
 )
 
 
@@ -84,19 +85,26 @@ if uploaded_files:
     # Leer y normalizar los datos con la clave si está disponible
     df_all = read_excel_files(temp_paths, api_key=gemini_api_key)
 
-    # Calcular métricas
-    df_metrics = compute_metrics(df_all)
-
-    # Generar resumen ejecutivo con Gemini si hay API key
+    # Usar Gemini para analizar todo el dataset y generar métricas y resumen
+    metrics_text = None
     summary_text = ""
     if gemini_api_key:
-        try:
-            summary_text = generate_summary_with_gemini(gemini_api_key, df_metrics)
-        except Exception:
-            summary_text = ""
+        analysis = get_full_analysis_with_gemini(gemini_api_key, df_all)
+        df_metrics = analysis.get('metrics') if analysis.get('metrics') is not None else pd.DataFrame()
+        summary_text = analysis.get('summary', '')
+        # Si Gemini no devolvió métricas, usar heurística como respaldo
+        if df_metrics.empty:
+            df_metrics = compute_metrics(df_all)
+    else:
+        # Si no hay API key, usar heurística y avisar al usuario
+        df_metrics = compute_metrics(df_all)
+        st.warning("No se encontró una clave de API de Gemini. Se utilizarán heurísticas locales para calcular las métricas y no se generará un análisis completo.")
 
     # Convertir Periodo a cadena para filtros y visualización
-    df_metrics['mes_str'] = df_metrics['mes'].astype(str)
+    if not df_metrics.empty and 'mes' in df_metrics.columns:
+        df_metrics['mes_str'] = df_metrics['mes'].astype(str)
+    else:
+        df_metrics['mes_str'] = ''
 
     # Filtros de Sidebar
     st.sidebar.header("Filtros")
@@ -123,6 +131,8 @@ if uploaded_files:
     if summary_text:
         st.markdown("## Resumen ejecutivo generado por Gemini")
         st.info(summary_text)
+    else:
+        st.info("No se recibió un resumen de Gemini. Puede deberse a un problema con la API o a que los datos no pudieron ser analizados.")
 
     # KPIs
     col1, col2, col3, col4 = st.columns(4)
