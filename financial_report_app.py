@@ -238,12 +238,12 @@ def get_full_analysis_with_gemini(api_key: str, df: pd.DataFrame) -> Dict[str, o
     result = {'metrics': pd.DataFrame(), 'summary': ''}
     if requests is None or not api_key or df.empty:
         return result
-    # Limit the number of rows to avoid overly long prompts
-    max_rows = 200
-    if len(df) > max_rows:
-        df_to_send = df.head(max_rows).copy()
-    else:
-        df_to_send = df.copy()
+    # Send the entire DataFrame to Gemini. Previously we limited the
+    # request to the first 200 rows to avoid hitting model token limits.
+    # To more closely match the behaviour of chatting directly with the AI on
+    # unstructured data, we now send all rows. Be aware that very large files
+    # may exceed the API's token limits and return an error.
+    df_to_send = df.copy()
     # Convert to CSV without index
     csv_data = df_to_send.to_csv(index=False)
     # Build prompt requesting JSON with metrics and summary
@@ -328,13 +328,17 @@ def detect_headers(df: pd.DataFrame, api_key: Optional[str] = None) -> Dict[int,
     Dict[int, str]
         Mapping from column index to a standard name.
     """
+    # If the dataframe is empty (no rows), we cannot sample any values. Return an empty mapping.
+    if df.empty or df.shape[0] == 0:
+        return {}
     n_cols = len(df.columns)
     mapping: Dict[int, str] = {}
     # If we have an API key, consult Gemini first
     suggestions: List[str] = []
     if api_key:
-        row_sample = df.iloc[0].tolist()
+        # Sample the first row to infer column labels. Protect against index errors.
         try:
+            row_sample = df.iloc[0].tolist()
             response = annotate_columns_with_gemini(api_key, row_sample)
             suggestions = parse_gemini_mapping(response, n_cols)
         except Exception:
@@ -438,10 +442,18 @@ def read_excel_files(paths: List[str], api_key: Optional[str] = None) -> pd.Data
         for sheet_name in xls.sheet_names:
             # Read each sheet without a header row
             df_raw = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+            # Skip entirely empty sheets
+            if df_raw.empty or df_raw.shape[0] == 0:
+                continue
             # Detect headers using Gemini (if api_key provided) or heuristics
             header_map = detect_headers(df_raw, api_key)
+            # If no headers could be detected and no heuristics apply, skip this sheet
+            if not header_map:
+                continue
             df_norm = normalize_dataframe(df_raw, header_map)
-            frames.append(df_norm)
+            # Only append non-empty DataFrames
+            if not df_norm.empty:
+                frames.append(df_norm)
     if frames:
         # Ensure each DataFrame has unique column names by removing duplicates
         frames_unique: List[pd.DataFrame] = []
