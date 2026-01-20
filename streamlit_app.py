@@ -160,17 +160,27 @@ def calculate_correlations(hours_data, financial_data):
 def generate_financial_analysis(processed_data, client):
     """Use Gemini to generate comprehensive financial analysis"""
     
-    # Prepare data summary for AI
-    data_summary = {
-        "cpt_plan_summary": processed_data["cpt_plan"].describe().to_dict() if processed_data["cpt_plan"] is not None else "Not provided",
-        "harvest_summary": processed_data["harvest_data"].describe().to_dict() if processed_data["harvest_data"] is not None else "Not provided",
-        "financial_summary": processed_data["financial_income"].describe().to_dict() if processed_data["financial_income"] is not None else "Not provided"
-    }
+    # Prepare data summary for AI - convert to string to avoid JSON serialization issues
+    def df_to_summary(df):
+        if df is None:
+            return "Not provided"
+        return df.head(20).to_string()
+    
+    data_context = f"""
+CPT PLAN DATA:
+{df_to_summary(processed_data["cpt_plan"])}
+
+HARVEST DATA:
+{df_to_summary(processed_data["harvest_data"])}
+
+FINANCIAL INCOME DATA:
+{df_to_summary(processed_data["financial_income"])}
+"""
     
     prompt = f"""You are a senior financial analyst at DEPT agency. Analyze this financial data and generate a comprehensive report.
 
 DATA PROVIDED:
-{json.dumps(data_summary, indent=2)}
+{data_context}
 
 Generate a detailed financial analysis following this structure:
 
