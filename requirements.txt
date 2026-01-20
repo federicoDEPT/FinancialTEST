@@ -2,6 +2,6 @@ streamlit
 pandas
 numpy
 openpyxl
-google-generativeai
+google-genai
 plotly
 scipy
