@@ -66,80 +66,139 @@ Respond with ONLY one word: CPT_PLAN, HARVEST_DATA, or FINANCIAL_INCOME"""
 def process_cpt_data(df):
     """Extract planned hours and rates from CPT plan"""
     try:
-        # Try to find columns with hours and rates
+        st.write("🔍 CPT Data Preview:")
+        st.write(f"Shape: {df.shape}, Columns: {list(df.columns)[:10]}")
+        
         data = {
             'total_planned_hours': 0,
             'total_planned_cost': 0,
             'team_breakdown': []
         }
         
+        # Clean the dataframe - remove completely empty rows/columns
+        df_clean = df.dropna(how='all').dropna(axis=1, how='all')
+        
         # Look for numeric columns
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
+        
+        st.write(f"Found {len(numeric_cols)} numeric columns")
         
         if len(numeric_cols) > 0:
-            # Sum all numeric values as rough estimate
+            # Try to sum all numeric columns
             for col in numeric_cols:
                 col_str = str(col).lower()
-                if 'hour' in col_str or 'time' in col_str:
-                    data['total_planned_hours'] += df[col].sum()
-                if 'rate' in col_str or 'cost' in col_str or 'price' in col_str:
-                    data['total_planned_cost'] += df[col].sum()
+                col_sum = df_clean[col].sum()
+                
+                st.write(f"Column '{col}': sum = {col_sum}")
+                
+                # If column name suggests hours, or if sum is reasonable for hours
+                if 'hour' in col_str or 'time' in col_str or (50 < col_sum < 10000):
+                    data['total_planned_hours'] += col_sum
+                
+                # If column name suggests cost/rate, or if sum is large (money)
+                if 'rate' in col_str or 'cost' in col_str or 'price' in col_str or col_sum > 10000:
+                    data['total_planned_cost'] += col_sum
         
+        st.success(f"✓ Extracted: {data['total_planned_hours']:.0f} hours, ${data['total_planned_cost']:.0f} cost")
         return data
     except Exception as e:
-        st.warning(f"Error processing CPT data: {e}")
+        st.error(f"Error processing CPT data: {e}")
         return {'total_planned_hours': 0, 'total_planned_cost': 0, 'team_breakdown': []}
 
 def process_harvest_data(df):
     """Extract actual hours from Harvest data"""
     try:
+        st.write("🔍 Harvest Data Preview:")
+        st.write(f"Shape: {df.shape}, Columns: {list(df.columns)[:10]}")
+        
         data = {
             'total_actual_hours': 0,
             'monthly_hours': {},
             'team_hours': {}
         }
         
+        # Clean the dataframe
+        df_clean = df.dropna(how='all').dropna(axis=1, how='all')
+        
         # Find date and hours columns
-        date_cols = [col for col in df.columns if 'date' in str(col).lower() or 'month' in str(col).lower()]
-        hour_cols = [col for col in df.columns if 'hour' in str(col).lower() or 'time' in str(col).lower()]
+        date_cols = [col for col in df_clean.columns if 'date' in str(col).lower() or 'month' in str(col).lower()]
+        hour_cols = [col for col in df_clean.columns if 'hour' in str(col).lower() or 'time' in str(col).lower()]
+        
+        # If no explicit hour columns, look for numeric columns with reasonable values
+        if not hour_cols:
+            numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
+            for col in numeric_cols:
+                col_sum = df_clean[col].sum()
+                if 10 < col_sum < 50000:  # Reasonable range for hours
+                    hour_cols.append(col)
+        
+        st.write(f"Found hour columns: {hour_cols}")
+        st.write(f"Found date columns: {date_cols}")
         
         if hour_cols:
-            data['total_actual_hours'] = df[hour_cols[0]].sum()
+            total = df_clean[hour_cols[0]].sum()
+            data['total_actual_hours'] = total
+            st.write(f"Total hours from '{hour_cols[0]}': {total}")
         
         # Try to group by month if date column exists
         if date_cols and hour_cols:
-            df_copy = df.copy()
+            df_copy = df_clean.copy()
             df_copy['date_parsed'] = pd.to_datetime(df_copy[date_cols[0]], errors='coerce')
             df_copy['month'] = df_copy['date_parsed'].dt.to_period('M')
             monthly = df_copy.groupby('month')[hour_cols[0]].sum()
-            data['monthly_hours'] = {str(k): float(v) for k, v in monthly.items()}
+            data['monthly_hours'] = {str(k): float(v) for k, v in monthly.items() if pd.notna(k)}
+            st.write(f"Monthly breakdown: {len(data['monthly_hours'])} months")
         
+        st.success(f"✓ Extracted: {data['total_actual_hours']:.0f} actual hours")
         return data
     except Exception as e:
-        st.warning(f"Error processing Harvest data: {e}")
+        st.error(f"Error processing Harvest data: {e}")
         return {'total_actual_hours': 0, 'monthly_hours': {}, 'team_hours': {}}
 
 def process_financial_data(df):
     """Extract revenue and income data"""
     try:
+        st.write("🔍 Financial Data Preview:")
+        st.write(f"Shape: {df.shape}, Columns: {list(df.columns)[:10]}")
+        
         data = {
             'total_income': 0,
             'monthly_income': {},
             'total_cost': 0
         }
         
+        # Clean the dataframe
+        df_clean = df.dropna(how='all').dropna(axis=1, how='all')
+        
         # Find relevant columns
-        income_cols = [col for col in df.columns if 'income' in str(col).lower() or 'revenue' in str(col).lower()]
-        cost_cols = [col for col in df.columns if 'cost' in str(col).lower() or 'expense' in str(col).lower() or 'burn' in str(col).lower()]
+        income_cols = [col for col in df_clean.columns if 'income' in str(col).lower() or 'revenue' in str(col).lower()]
+        cost_cols = [col for col in df_clean.columns if 'cost' in str(col).lower() or 'expense' in str(col).lower() or 'burn' in str(col).lower()]
+        
+        # If not found by name, look for large numeric columns
+        if not income_cols and not cost_cols:
+            numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
+            for col in numeric_cols:
+                col_sum = df_clean[col].sum()
+                if col_sum > 1000:  # Assume financial data
+                    income_cols.append(col)
+        
+        st.write(f"Found income columns: {income_cols}")
+        st.write(f"Found cost columns: {cost_cols}")
         
         if income_cols:
-            data['total_income'] = float(df[income_cols[0]].sum())
+            total = float(df_clean[income_cols[0]].sum())
+            data['total_income'] = total
+            st.write(f"Total income from '{income_cols[0]}': ${total:,.0f}")
+            
         if cost_cols:
-            data['total_cost'] = float(df[cost_cols[0]].sum())
+            total = float(df_clean[cost_cols[0]].sum())
+            data['total_cost'] = total
+            st.write(f"Total cost from '{cost_cols[0]}': ${total:,.0f}")
         
+        st.success(f"✓ Extracted: ${data['total_income']:,.0f} income, ${data['total_cost']:,.0f} cost")
         return data
     except Exception as e:
-        st.warning(f"Error processing financial data: {e}")
+        st.error(f"Error processing financial data: {e}")
         return {'total_income': 0, 'monthly_income': {}, 'total_cost': 0}
 
 def generate_ai_insights(data_summary, client):
@@ -361,14 +420,14 @@ def main():
             with col1:
                 st.plotly_chart(
                     create_efficiency_gauge(efficiency),
-                    use_container_width=True
+                    use_container_width=False
                 )
             
             with col2:
                 if planned_hours > 0 and actual_hours > 0:
                     st.plotly_chart(
                         create_variance_chart(planned_hours, actual_hours, "Hours"),
-                        use_container_width=True
+                        use_container_width=False
                     )
             
             # Monthly breakdown if available
@@ -389,9 +448,9 @@ def main():
                         title='Monthly Hours Trend',
                         markers=True
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=False)
                     
-                    st.dataframe(monthly_df, use_container_width=True)
+                    st.dataframe(monthly_df, width='stretch')
             
             # AI Insights
             st.markdown("## 💡 AI-Powered Insights")
@@ -417,19 +476,19 @@ def main():
             
             with tabs[0]:
                 if file_data['cpt_plan'] is not None:
-                    st.dataframe(file_data['cpt_plan'], use_container_width=True)
+                    st.dataframe(file_data['cpt_plan'], width='stretch')
                 else:
                     st.info("No CPT Plan data uploaded")
             
             with tabs[1]:
                 if file_data['harvest_data'] is not None:
-                    st.dataframe(file_data['harvest_data'], use_container_width=True)
+                    st.dataframe(file_data['harvest_data'], width='stretch')
                 else:
                     st.info("No Harvest data uploaded")
             
             with tabs[2]:
                 if file_data['financial_income'] is not None:
-                    st.dataframe(file_data['financial_income'], use_container_width=True)
+                    st.dataframe(file_data['financial_income'], width='stretch')
                 else:
                     st.info("No Financial Income data uploaded")
             
