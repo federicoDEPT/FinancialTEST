@@ -27,7 +27,12 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from financial_report_app import read_excel_files, compute_metrics
+from financial_report_app import (
+    read_excel_files,
+    compute_metrics,
+    generate_summary_with_gemini,
+    generate_financial_report,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -82,6 +87,14 @@ if uploaded_files:
     # Calcular métricas
     df_metrics = compute_metrics(df_all)
 
+    # Generar resumen ejecutivo con Gemini si hay API key
+    summary_text = ""
+    if gemini_api_key:
+        try:
+            summary_text = generate_summary_with_gemini(gemini_api_key, df_metrics)
+        except Exception:
+            summary_text = ""
+
     # Convertir Periodo a cadena para filtros y visualización
     df_metrics['mes_str'] = df_metrics['mes'].astype(str)
 
@@ -105,6 +118,11 @@ if uploaded_files:
         (df_metrics['equipo'].isin(equipos)) &
         (df_metrics['mes_str'].isin(periodos))
     ]
+
+    # Mostrar resumen ejecutivo si existe
+    if summary_text:
+        st.markdown("## Resumen ejecutivo generado por Gemini")
+        st.info(summary_text)
 
     # KPIs
     col1, col2, col3, col4 = st.columns(4)
@@ -132,6 +150,22 @@ if uploaded_files:
     # Tabla de datos
     st.subheader("Tabla de métricas")
     st.dataframe(df_filtrado)
+
+    # Opción de descargar el informe en PDF
+    if not df_metrics.empty:
+        # Ruta temporal para el PDF
+        pdf_path = "/tmp/informe_financiero.pdf"
+        # Generar PDF con el resumen (si hay)
+        generate_financial_report(df_metrics, pdf_path, company_name="Informe", summary=summary_text)
+        # Leer el PDF en modo binario
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+        st.download_button(
+            label="Descargar informe en PDF",
+            data=pdf_bytes,
+            file_name="informe_financiero.pdf",
+            mime="application/pdf"
+        )
 
 else:
     st.info("Sube uno o varios archivos Excel para comenzar.")
