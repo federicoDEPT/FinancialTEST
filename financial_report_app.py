@@ -249,8 +249,8 @@ def get_full_analysis_with_gemini(api_key: str, df: pd.DataFrame) -> Dict[str, o
     # Build prompt requesting JSON with metrics and summary
     prompt = (
         "You are a financial analyst. The following is the content of an Excel file in CSV format. "
-        "Identify the columns corresponding to date, team, hours, rate and revenue. "
-        "Group the data by month and team and compute the following metrics: total hours, burned value (hours × rate), total revenue, efficiency (revenue divided by burned value) and profit or loss (revenue minus burned value). "
+        "Identify which columns correspond to date, team, hours, rate and revenue. Numeric values may include currency symbols (such as $, €, £), thousand separators (commas or periods) or parentheses for negatives; interpret them as numbers. "
+        "Group the data by month and team and compute these metrics: total hours, burned value (hours × rate), total revenue, efficiency (revenue divided by burned value) and profit or loss (revenue minus burned value). "
         "Return the response as a JSON object with two keys: 'metrics' and 'summary'. "
         "'metrics' should be a list of objects with the keys 'month', 'team', 'hours', 'burned_value', 'revenue', 'efficiency' and 'profit_loss'. "
         "'summary' should be a text that summarises the findings and recommendations in English.\n\n"
