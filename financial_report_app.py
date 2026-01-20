@@ -14,6 +14,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from typing import List, Dict
+import json
 from pathlib import Path
 from fpdf import FPDF
 
@@ -37,11 +38,14 @@ def annotate_columns_with_gemini(api_key: str, sample_row: List) -> str:
     if requests is None or api_key is None:
         return ""
 
+    # Construir un prompt estructurado para obtener una lista de etiquetas en orden.
+    # Se solicita explícitamente una estructura JSON para facilitar el parseo de la respuesta.
     prompt = (
         "Estas son las celdas de la primera fila de un archivo Excel. "
-        "Identifica el rol probable de cada columna (fecha, horas, tarifa, ingreso, equipo, etc.) "
-        "y devuelve una lista con las etiquetas correspondientes: "
-        + str(sample_row)
+        "Devuelve un JSON con la clave 'labels' que contenga una lista de etiquetas estandarizadas "
+        "para cada columna en el mismo orden. Las etiquetas válidas son 'fecha', 'equipo', 'horas', 'tarifa', 'ingreso'.\n"
+        "Ejemplo de respuesta: {\"labels\": [\"fecha\", \"equipo\", \"horas\", \"tarifa\", \"ingreso\"]}.\n"
+        "Celdas: " + str(sample_row)
     )
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
     headers = {"Content-Type": "application/json"}
@@ -66,9 +70,10 @@ import re
 
 def parse_gemini_mapping(response: str, n_cols: int) -> List[str]:
     """
-    Intenta extraer un listado de etiquetas de la respuesta de Gemini. Se espera que
-    la respuesta devuelva una lista de etiquetas separadas por comas o saltos de línea
-    (p. ej., "fecha, equipo, horas, tarifa, ingreso").
+    Intenta interpretar la respuesta de Gemini para obtener una lista de etiquetas. El
+    modelo debería devolver un JSON con la clave 'labels', pero si devuelve texto
+    libre o una lista simple, se usan expresiones regulares para extraer las
+    etiquetas válidas.
 
     Parameters
     ----------
@@ -85,12 +90,31 @@ def parse_gemini_mapping(response: str, n_cols: int) -> List[str]:
     """
     if not response:
         return []
-    # Eliminar texto extra y conservar líneas con palabras clave conocidas
-    # Buscamos palabras clave estándar (fecha, horas, tarifa, ingreso, equipo) en el orden en que aparecen
-    # Utilizamos expresiones regulares para encontrar coincidencias.
+    text = response.strip()
+    # Intentar parsear como JSON para facilitar la extracción
+    try:
+        import json
+        data = json.loads(text)
+        if isinstance(data, dict) and 'labels' in data:
+            labels_raw = data['labels']
+        elif isinstance(data, list):
+            labels_raw = data
+        else:
+            labels_raw = []
+        valid_labels = []
+        for item in labels_raw:
+            if isinstance(item, str):
+                low = item.strip().lower()
+                if low in ['fecha', 'equipo', 'horas', 'tarifa', 'ingreso']:
+                    valid_labels.append(low)
+        if valid_labels:
+            return valid_labels
+    except Exception:
+        pass
+    # Si no se pudo parsear JSON, utilizar expresiones regulares como respaldo
     keywords = ["fecha", "horas", "tarifa", "ingreso", "equipo"]
-    labels = []
-    for word in re.findall(r"\b\w+\b", response.lower()):
+    labels: List[str] = []
+    for word in re.findall(r"\b\w+\b", text.lower()):
         if word in keywords and word not in labels:
             labels.append(word)
         if len(labels) >= n_cols:
@@ -148,6 +172,90 @@ def generate_summary_with_gemini(api_key: str, df_metrics: pd.DataFrame) -> str:
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
         return ""
+
+
+def get_full_analysis_with_gemini(api_key: str, df: pd.DataFrame) -> Dict[str, object]:
+    """
+    Envía el contenido completo del DataFrame a Gemini en formato CSV y pide
+    que identifique las columnas relevantes, calcule métricas mensuales por
+    equipo (horas, valor quemado, ingreso, eficiencia y ganancia/pérdida) y
+    devuelva tanto las métricas como un resumen ejecutivo. El modelo debe
+    responder con un JSON que contenga dos claves: "metrics" (lista de
+    objetos) y "summary" (cadena).
+
+    Nota: Los modelos generativos tienen un límite de tokens. Para evitar
+    excederlo, se limita el número de filas enviadas. Si el DataFrame tiene
+    más de 200 filas, se envían solo las primeras 200.
+
+    Parameters
+    ----------
+    api_key : str
+        Clave de API de Gemini.
+    df : pd.DataFrame
+        DataFrame con los datos originales del Excel (antes de normalizar).
+
+    Returns
+    -------
+    dict
+        Diccionario con dos claves:
+        - 'metrics': DataFrame con las métricas calculadas por Gemini o vacío si falla la llamada.
+        - 'summary': cadena con el resumen ejecutivo.
+    """
+    result = {'metrics': pd.DataFrame(), 'summary': ''}
+    if requests is None or api_key is None or df.empty:
+        return result
+    # Limitar el número de filas para evitar prompts demasiado grandes
+    max_rows = 200
+    if len(df) > max_rows:
+        df_to_send = df.head(max_rows).copy()
+    else:
+        df_to_send = df.copy()
+    # Convertir a CSV sin índice
+    csv_data = df_to_send.to_csv(index=False)
+    # Construir prompt solicitando JSON con métricas y resumen
+    prompt = (
+        "Eres un analista financiero. A continuación se presenta el contenido de un archivo Excel en formato CSV. "
+        "Debes identificar las columnas correspondientes a fecha, equipo, horas, tarifa e ingreso, "
+        "agrupando los datos por mes y equipo para calcular las siguientes métricas: horas totales, valor quemado (horas×tarifa), ingreso total, eficiencia (ingreso/valor quemado) y ganancia o pérdida (ingreso - valor quemado). "
+        "Devuelve la respuesta en formato JSON con dos claves: 'metrics' y 'summary'. 'metrics' debe ser una lista de objetos con las claves 'mes', 'equipo', 'horas', 'valor_quemado', 'ingreso', 'eficiencia' y 'ganancia_perdida'. 'summary' debe ser un texto que resuma los hallazgos y recomendaciones.\n\n"
+        + "CSV:\n" + csv_data
+    )
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [
+            {"parts": [{"text": prompt}]}
+        ],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048}
+    }
+    params = {"key": api_key}
+    try:
+        resp = requests.post(url, json=payload, params=params, headers=headers)
+        resp.raise_for_status()
+        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        # Intentar parsear como JSON
+        data = json.loads(text)
+        # Convertir metrics a DataFrame si corresponde
+        metrics_list = data.get('metrics') if isinstance(data, dict) else None
+        if isinstance(metrics_list, list):
+            df_metrics = pd.DataFrame(metrics_list)
+            # Asegurar que columnas numéricas se conviertan correctamente
+            for col in ['horas', 'valor_quemado', 'ingreso', 'eficiencia', 'ganancia_perdida']:
+                if col in df_metrics.columns:
+                    df_metrics[col] = pd.to_numeric(df_metrics[col], errors='coerce')
+            # Convertir 'mes' a period (si es string)
+            if 'mes' in df_metrics.columns:
+                df_metrics['mes'] = df_metrics['mes'].astype(str)
+        else:
+            df_metrics = pd.DataFrame()
+        result['metrics'] = df_metrics
+        summary_text = data.get('summary', '') if isinstance(data, dict) else ''
+        result['summary'] = summary_text
+    except Exception:
+        # Si no se puede parsear o falla la llamada, devolver resultado vacío
+        result['metrics'] = pd.DataFrame()
+        result['summary'] = ''
+    return result
 
 
 # -----------------------------------------------------------------------------
