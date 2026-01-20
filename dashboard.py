@@ -145,7 +145,8 @@ if uploaded_files:
             title='Eficiencia por equipo y mes',
             labels={'mes_str': 'Mes', 'eficiencia': 'Eficiencia'},
         )
-        st.plotly_chart(fig_eff, use_container_width=True)
+        # Mostrar gráfico. Streamlit recomienda sustituir use_container_width tras 2025-12-31
+        st.plotly_chart(fig_eff, width='stretch')
 
     # Tabla de datos
     st.subheader("Tabla de métricas")
