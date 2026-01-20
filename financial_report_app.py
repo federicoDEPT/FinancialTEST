@@ -359,9 +359,25 @@ def detect_headers(df: pd.DataFrame, api_key: Optional[str] = None) -> Dict[int,
                 continue
         except Exception:
             pass
-        # If numeric
-        if pd.api.types.is_numeric_dtype(series):
-            mean_val = series.astype(float).mean()
+        # Attempt to interpret as numeric by cleaning currency symbols and separators
+        # Convert the series to string for cleaning
+        s_str = series.astype(str)
+        # Remove any characters that are not digits, commas, dots or minus signs
+        cleaned = s_str.str.replace(r'[^\d,\.\-]', '', regex=True)
+        # Function to unify decimal separators: if there is a single comma and no dot, replace comma with dot
+        def unify_decimal(val: str) -> str:
+            if val.count(',') == 1 and val.count('.') == 0:
+                return val.replace(',', '.')
+            return val
+        unified = cleaned.apply(unify_decimal)
+        # Convert to numeric (coerces errors to NaN)
+        numeric_series = pd.to_numeric(unified, errors='coerce')
+        # Determine if this should be treated as numeric
+        if numeric_series.notna().sum() >= max(1, int(0.3 * len(series))):
+            # Compute the mean value of the numeric data (ignoring NaN)
+            mean_val = numeric_series.mean()
+            # Use heuristics to classify the numeric column based on typical value ranges
+            # Smaller means correspond to hours, mid-range to rate, larger to revenue
             if mean_val < 50:
                 mapping[idx] = 'hours'
             elif mean_val < 500:
@@ -369,6 +385,7 @@ def detect_headers(df: pd.DataFrame, api_key: Optional[str] = None) -> Dict[int,
             else:
                 mapping[idx] = 'revenue'
         else:
+            # If not numeric and not date, treat as team
             mapping[idx] = 'team'
     return mapping
 
