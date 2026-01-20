@@ -59,6 +59,95 @@ def annotate_columns_with_gemini(api_key: str, sample_row: List) -> str:
     except Exception:
         return resp.text
 
+# -----------------------------------------------------------------------------
+# Utilidades para interpretar la respuesta de Gemini y generar resúmenes
+# -----------------------------------------------------------------------------
+import re
+
+def parse_gemini_mapping(response: str, n_cols: int) -> List[str]:
+    """
+    Intenta extraer un listado de etiquetas de la respuesta de Gemini. Se espera que
+    la respuesta devuelva una lista de etiquetas separadas por comas o saltos de línea
+    (p. ej., "fecha, equipo, horas, tarifa, ingreso").
+
+    Parameters
+    ----------
+    response : str
+        Texto devuelto por la API de Gemini.
+    n_cols : int
+        Número de columnas en el DataFrame original.
+
+    Returns
+    -------
+    List[str]
+        Lista de etiquetas interpretadas. Si no se pueden extraer correctamente,
+        se devuelve una lista vacía.
+    """
+    if not response:
+        return []
+    # Eliminar texto extra y conservar líneas con palabras clave conocidas
+    # Buscamos palabras clave estándar (fecha, horas, tarifa, ingreso, equipo) en el orden en que aparecen
+    # Utilizamos expresiones regulares para encontrar coincidencias.
+    keywords = ["fecha", "horas", "tarifa", "ingreso", "equipo"]
+    labels = []
+    for word in re.findall(r"\b\w+\b", response.lower()):
+        if word in keywords and word not in labels:
+            labels.append(word)
+        if len(labels) >= n_cols:
+            break
+    return labels
+
+def generate_summary_with_gemini(api_key: str, df_metrics: pd.DataFrame) -> str:
+    """
+    Genera un resumen ejecutivo a partir del DataFrame de métricas mediante la API
+    de Gemini. El prompt describe la estructura del DataFrame y pide insights
+    clave, tendencias y recomendaciones. Si no se proporciona api_key, se
+    devolverá una cadena vacía.
+
+    Parameters
+    ----------
+    api_key : str
+        Clave de API para Gemini.
+    df_metrics : pd.DataFrame
+        DataFrame con columnas ['mes','equipo','horas','valor_quemado','ingreso','eficiencia','ganancia_perdida'].
+
+    Returns
+    -------
+    str
+        Resumen generado por Gemini o cadena vacía si falla la llamada.
+    """
+    if requests is None or api_key is None or df_metrics.empty:
+        return ""
+    # Convertir las métricas a una cadena de tabla simplificada
+    table_lines = ["mes\tequipo\thoras\tvalor_quemado\tingreso\teficiencia\tganancia_perdida"]
+    for _, row in df_metrics.iterrows():
+        line = f"{row['mes']}\t{row['equipo']}\t{row['horas']:.1f}\t{row['valor_quemado']:.2f}\t{row['ingreso']:.2f}\t{row['eficiencia']:.2f}\t{row['ganancia_perdida']:.2f}"
+        table_lines.append(line)
+    table_text = "\n".join(table_lines)
+    prompt = (
+        "A continuación se presentan métricas financieras mensuales por equipo en formato de tabla con las columnas: "
+        "mes (periodo mensual), equipo, horas totales, valor quemado (horas×tarifa), ingreso total, eficiencia (ingreso/valor quemado) y ganancia o pérdida. "
+        "Analiza la tabla, identifica tendencias destacadas, patrones de eficiencia y riesgos financieros. "
+        "Resume la situación de cada equipo, destacando meses con sobreconsumo (alta quema) o alta eficiencia, e incluye recomendaciones para mejorar los resultados. "
+        "No devuelvas la tabla, sólo el análisis y recomendaciones.\n\n"
+        + table_text
+    )
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [
+            {"parts": [{"text": prompt}]}
+        ],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 512}
+    }
+    params = {"key": api_key}
+    try:
+        resp = requests.post(url, json=payload, params=params, headers=headers)
+        resp.raise_for_status()
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        return ""
+
 
 # -----------------------------------------------------------------------------
 # Detección de encabezados y normalización
@@ -103,24 +192,56 @@ def detect_headers(df: pd.DataFrame, api_key: str = None) -> Dict[int, str]:
         else:
             mapping[idx] = 'equipo'
 
-    # Llamada opcional a Gemini (sin parseo de respuesta en este ejemplo)
+    # Llamada opcional a Gemini para sugerir etiquetas
     if api_key:
         row_sample = df.iloc[0].tolist()
-        _ = annotate_columns_with_gemini(api_key, row_sample)
-        # Se podría analizar la respuesta y actualizar mapping
+        try:
+            response = annotate_columns_with_gemini(api_key, row_sample)
+            suggestions = parse_gemini_mapping(response, len(df.columns))
+            # Actualizar mapping según las sugerencias: asignar cada sugerencia al índice correspondiente
+            for idx_s, label in enumerate(suggestions):
+                # Si ya existe un mapeo, no lo sobrescribimos
+                if idx_s not in mapping:
+                    mapping[idx_s] = label
+        except Exception:
+            pass
     return mapping
 
 
 def normalize_dataframe(df: pd.DataFrame, header_map: Dict[int, str]) -> pd.DataFrame:
-    """Renombra las columnas según header_map y devuelve solo las estándar."""
-    # Crear un diccionario de renombrado basado en índices
+    """
+    Renombra las columnas según ``header_map`` y devuelve solo las columnas estándar.
+
+    Si dos o más columnas se mapean al mismo nombre estándar (por ejemplo, si
+    varias columnas se clasifican como "equipo"), pandas permite columnas
+    duplicadas, lo que más tarde provoca un ``InvalidIndexError`` al concatenar
+    dataframes. Para evitarlo, después del renombrado se eliminan las
+    columnas duplicadas conservando la primera aparición.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame sin encabezado leído directamente del Excel.
+    header_map : Dict[int, str]
+        Mapeo de índice de columna a nombre estándar.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame con columnas únicas ['fecha','equipo','horas','tarifa','ingreso'].
+    """
+    # Renombrar columnas según el mapeo de índices
     rename_dict = {df.columns[idx]: std_name for idx, std_name in header_map.items()}
     df = df.rename(columns=rename_dict)
+    # Eliminar columnas duplicadas (conservar la primera)
+    df = df.loc[:, ~df.columns.duplicated()]
+    # Seleccionar columnas deseadas en orden
     desired_cols = ['fecha', 'equipo', 'horas', 'tarifa', 'ingreso']
-    # Añadir columnas faltantes
+    # Añadir columnas faltantes con NaN
     for col in desired_cols:
         if col not in df.columns:
             df[col] = np.nan
+    # Devuelve solo las columnas deseadas, en el orden especificado
     return df[desired_cols]
 
 
@@ -196,14 +317,26 @@ class FinancialPDF(FPDF):
         self.cell(0, 10, f'Página {self.page_no()}', 0, 0, 'C')
 
 
-def generate_financial_report(df_metrics: pd.DataFrame, output_path: str, company_name: str = "Informe"):
+def generate_financial_report(
+    df_metrics: pd.DataFrame,
+    output_path: str,
+    company_name: str = "Informe",
+    summary: str | None = None,
+) -> None:
     """
-    Genera un PDF simple con los resultados en df_metrics.
+    Genera un informe PDF con las métricas y un resumen opcional.
 
-    Parameters:
-        df_metrics: DataFrame con columnas ['mes','equipo','horas','valor_quemado','ingreso','eficiencia','ganancia_perdida'].
-        output_path: ruta donde se guardará el PDF.
-        company_name: nombre de la organización o proyecto.
+    Parameters
+    ----------
+    df_metrics : pd.DataFrame
+        DataFrame con columnas ['mes','equipo','horas','valor_quemado','ingreso','eficiencia','ganancia_perdida'].
+    output_path : str
+        Ruta donde se guardará el PDF.
+    company_name : str, opcional
+        Nombre de la organización o proyecto.
+    summary : str, opcional
+        Resumen ejecutivo que se incluirá al inicio del informe. Si se omite o
+        ``None``, se mostrará solo una breve introducción.
     """
     pdf = FinancialPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -213,13 +346,22 @@ def generate_financial_report(df_metrics: pd.DataFrame, output_path: str, compan
     pdf.set_font('Arial', 'B', 16)
     pdf.cell(0, 10, f'INFORME FINANCIERO - {company_name}', ln=True)
     pdf.ln(4)
-    # Resumen
+    # Introducción y resumen
     pdf.set_font('Arial', '', 11)
-    pdf.multi_cell(0, 6, (
+    intro = (
         "Este informe presenta la evolución de las horas trabajadas, el valor de trabajo "
         "quemado, los ingresos y la eficiencia de cada equipo por mes. Los valores se "
-        "calculan automáticamente a partir de los archivos Excel cargados."))
-    pdf.ln(8)
+        "calculan automáticamente a partir de los archivos Excel cargados."
+    )
+    pdf.multi_cell(0, 6, intro)
+    pdf.ln(4)
+    if summary:
+        # Añadir encabezado para el resumen
+        pdf.set_font('Arial', 'B', 12)
+        pdf.cell(0, 7, "Resumen ejecutivo", ln=True)
+        pdf.set_font('Arial', '', 10)
+        pdf.multi_cell(0, 5, summary.strip())
+        pdf.ln(4)
 
     # Encabezados de tabla
     pdf.set_font('Arial', 'B', 10)
@@ -266,6 +408,13 @@ if __name__ == '__main__':
     df_all = read_excel_files(args.files, api_key=args.api_key)
     # Calcular métricas
     df_metrics = compute_metrics(df_all)
-    # Generar PDF
-    generate_financial_report(df_metrics, args.output, company_name=args.company)
+    # Generar resumen con Gemini si se proporciona API key
+    summary = None
+    if args.api_key:
+        try:
+            summary = generate_summary_with_gemini(args.api_key, df_metrics)
+        except Exception:
+            summary = None
+    # Generar PDF con resumen opcional
+    generate_financial_report(df_metrics, args.output, company_name=args.company, summary=summary)
     print(f'Informe generado en {args.output}')
